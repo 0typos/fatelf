@@ -31,9 +31,61 @@ static DESCRIPTOR: [u8; 16] = [
     0,
 ];
 
-/// Keep the capability descriptor reachable when the runtime is linked and stripped.
+const IDENTITY_TAG: &[u8; 8] = b"FATID01\0";
+const IDENTITY_FIELD_SIZE: usize = 65;
+
+#[used]
+#[unsafe(link_section = ".fatelf.identity")]
+static IDENTITY: [u8; IDENTITY_TAG.len() + 2 * IDENTITY_FIELD_SIZE] = {
+    let mut bytes = [0; IDENTITY_TAG.len() + 2 * IDENTITY_FIELD_SIZE];
+    let (tag, _) = bytes.split_at_mut(IDENTITY_TAG.len());
+    tag.copy_from_slice(IDENTITY_TAG);
+    bytes
+};
+
+/// Keep the launcher metadata reachable when the runtime is linked and stripped.
 pub(crate) fn retain() {
-    std::hint::black_box(&DESCRIPTOR);
+    std::hint::black_box((&DESCRIPTOR, &IDENTITY));
+}
+
+/// Fill the identity slot in a copy of an unbundled launcher.
+#[cfg(feature = "builder")]
+pub(crate) fn set_launcher_identity(
+    bytes: &mut [u8],
+    name: Option<&str>,
+    version: Option<&str>,
+) -> Result<(), Error> {
+    let elf = object::File::parse(&*bytes)?;
+    let mut sections = elf
+        .sections()
+        .filter(|section| section.name() == Ok(".fatelf.identity"));
+    let slot = sections.next().ok_or_else(|| {
+        Error::Invalid(
+            "launcher lacks a build identity slot; install the launcher paired with this fatelf"
+                .into(),
+        )
+    })?;
+    let invalid = || Error::Invalid("invalid launcher build identity slot".into());
+    if sections.next().is_some() || slot.data()? != IDENTITY {
+        return Err(invalid());
+    }
+    let (offset, _) = slot.file_range().ok_or_else(invalid)?;
+    let offset = usize::try_from(offset).map_err(|_| invalid())?;
+    let fields = bytes
+        .get_mut(offset..)
+        .and_then(|slot| slot.get_mut(IDENTITY_TAG.len()..IDENTITY.len()))
+        .ok_or_else(invalid)?;
+    let (name_field, version_field) = fields.split_at_mut(IDENTITY_FIELD_SIZE);
+    for (field, value) in [(name_field, name), (version_field, version)] {
+        if let Some(value) = value {
+            let prefix = field
+                .get_mut(..IDENTITY_FIELD_SIZE - 1)
+                .and_then(|field| field.get_mut(..value.len()))
+                .ok_or_else(invalid)?;
+            prefix.copy_from_slice(value.as_bytes());
+        }
+    }
+    Ok(())
 }
 
 /// Decoder options of a launcher with the current compatibility revision.

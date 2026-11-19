@@ -7,6 +7,7 @@ use std::{
     process::{Command, Output},
 };
 
+use object::{Object, ObjectSection};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
@@ -115,12 +116,64 @@ fn toml_build_matches_direct_pack_and_aligns_relative_paths_to_config() {
 }
 
 #[test]
+fn builds_embed_distinct_launcher_identities_without_changing_capabilities() {
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("bundle.toml");
+    let launcher_path = env!("CARGO_BIN_EXE_fatelf-launcher");
+    let launcher_bytes = fs::read(launcher_path).unwrap();
+    let launcher = object::File::parse(launcher_bytes.as_slice()).unwrap();
+    let descriptor = launcher.section_by_name(".fatelf").unwrap().data().unwrap();
+    for name in ["staging", "production"] {
+        let version = format!("{name}-{}", "v".repeat(63 - name.len()));
+        let mut config = settings(name);
+        config["launcher_name"] = json!(name);
+        config["launcher_version"] = json!(version);
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        success(&tool(
+            &[
+                "build".into(),
+                "--config".into(),
+                config_path.as_os_str().into(),
+            ],
+            directory.path(),
+        ));
+        let bundle_path = directory.path().join(name);
+        let bytes = fs::read(&bundle_path).unwrap();
+        let bundle = object::File::parse(bytes.as_slice()).unwrap();
+        let identity = bundle
+            .section_by_name(".fatelf.identity")
+            .unwrap()
+            .data()
+            .unwrap();
+        assert_eq!(identity.len(), 138);
+        assert_eq!(&identity[..8], b"FATID01\0");
+        assert_eq!(&identity[8..8 + name.len()], name.as_bytes());
+        assert!(identity[8 + name.len()..73].iter().all(|&byte| byte == 0));
+        assert_eq!(&identity[73..137], version.as_bytes());
+        assert_eq!(identity[137], 0);
+        assert_eq!(
+            bundle.section_by_name(".fatelf").unwrap().data().unwrap(),
+            descriptor
+        );
+        success(
+            &Command::new(bundle_path)
+                .env("APP_MODE", "a")
+                .output()
+                .unwrap(),
+        );
+    }
+    assert_eq!(fs::read(launcher_path).unwrap(), launcher_bytes);
+}
+
+#[test]
 fn invalid_or_unknown_config_fields_fail_before_output_creation() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("bundle.toml");
     let mutations: &[(&str, &str, Value)] = &[
         ("", "version", json!(1)),
         ("", "unknown", json!(true)),
+        ("", "launcher_name", json!("a b")),
+        ("", "launcher_version", json!("v".repeat(65))),
         ("storage", "layout", json!("scattered")),
         ("storage", "unknown", json!(1)),
         ("selection", "unknown", json!("bad")),

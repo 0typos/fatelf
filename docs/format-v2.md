@@ -69,6 +69,12 @@ independent of the v2 container format. Upgrade the packer and launcher as a
 pair when building new bundles. Existing v2 bundles retain their own launcher
 and can still be inspected, verified, and extracted by current tools.
 
+Launchers with build labels carry a `.fatelf.identity` ELF section. It contains
+the NUL-terminated tag `FATID01`, then two 65-byte NUL-padded fields for launcher name
+and version. An unset field is zero-filled. Builders fill the reserved section
+in the bundle's launcher copy. The compatibility descriptor retains its own
+revision and codec flags.
+
 **Version break:** TOML schema and container format are independently version 2.
 v1 configs/readers are unsupported; existing standalone v1 executables retain
 their own old launcher. Compatibility policy is documented in the [release procedure](release/README.md).

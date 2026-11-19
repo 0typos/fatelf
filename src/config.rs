@@ -43,6 +43,10 @@ pub(crate) struct BuildConfig {
     pub(crate) output: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) launcher: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launcher_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launcher_version: Option<String>,
     pub(crate) payloads: Vec<Input>,
     #[serde(default)]
     pub(crate) selection: Selection,
@@ -141,6 +145,8 @@ impl BuildConfig {
             version: 2,
             output: "combined".into(),
             launcher: None,
+            launcher_name: None,
+            launcher_version: None,
             payloads: ["a", "b"]
                 .into_iter()
                 .map(|name| Input::new(name.into(), PathBuf::new()))
@@ -204,6 +210,8 @@ impl BuildConfig {
                 .collect(),
             output: resolve(base, &self.output),
             launcher: self.launcher.as_ref().map(|path| resolve(base, path)),
+            launcher_name: self.launcher_name.clone(),
+            launcher_version: self.launcher_version.clone(),
             select_env: self.selection.env.clone(),
             default: self.selection.default.clone(),
             backend: self.execution.backend,

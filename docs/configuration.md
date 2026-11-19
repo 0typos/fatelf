@@ -4,6 +4,18 @@ TOML is the build source of truth. Relative output, launcher, payload, and
 build-time key paths resolve from the canonical config directory, even when
 the config is opened through a symlink. Absolute paths are also accepted. An omitted launcher uses `fatelf-launcher` beside the packer.
 
+Set optional top-level labels to identify the bundled launcher across environments.
+
+```toml
+launcher_name = "fatelf-staging"
+launcher_version = "2026.11.19-staging"
+```
+
+Each accepts 1 to 64 ASCII letters, digits, dots, underscores or hyphens.
+The paired launcher must support the build identity slot when either label is set.
+`fatelf plan --config bundle.toml` checks this before deployment.
+Read the labels with `readelf -p .fatelf.identity ./combined`.
+
 ```sh
 fatelf configure --output /full/path/bundle.toml
 fatelf configure --config /full/path/bundle.toml

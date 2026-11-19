@@ -148,6 +148,11 @@ pub(crate) struct PackOptions {
     /// Launcher ELF (defaults to fatelf-launcher beside this tool).
     #[arg(long)]
     pub(crate) launcher: Option<PathBuf>,
+    /// Build identity labels, configured through TOML.
+    #[arg(skip)]
+    pub(crate) launcher_name: Option<String>,
+    #[arg(skip)]
+    pub(crate) launcher_version: Option<String>,
     /// Environment variable selecting a payload by name.
     #[arg(long, default_value = "FATELF_VARIANT")]
     pub(crate) select_env: String,
@@ -231,6 +236,18 @@ impl PackOptions {
     /// Validate shared CLI/config semantics without reading or writing input files.
     pub(crate) fn validate(&self) -> Result<(), Error> {
         self.budgets.validate()?;
+        for (field, value) in [
+            ("launcher_name", self.launcher_name.as_deref()),
+            ("launcher_version", self.launcher_version.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_name(value).map_err(|_| {
+                    Error::Invalid(format!(
+                        "{field} must contain 1 to 64 ASCII letters, digits, dots, underscores or hyphens"
+                    ))
+                })?;
+            }
+        }
         if let Some(mask) = &self.xor_mask {
             codec::validate_xor_mask(mask)?;
             if self.xor {
@@ -420,9 +437,16 @@ impl PackOptions {
     fn prepare(&self) -> Result<Prepared<'_>, Error> {
         self.validate()?;
         let launcher_path = self.launcher_path()?;
-        let launcher = Elf::read(&launcher_path)?;
+        let mut launcher = Elf::read(&launcher_path)?;
         let launcher_codecs =
             capabilities::launcher_codecs(&object::File::parse(launcher.bytes.as_slice())?)?;
+        if self.launcher_name.is_some() || self.launcher_version.is_some() {
+            capabilities::set_launcher_identity(
+                &mut launcher.bytes,
+                self.launcher_name.as_deref(),
+                self.launcher_version.as_deref(),
+            )?;
+        }
         let mut pool = Pool::new(
             self.budgets.clone(),
             self.xor_mask.as_deref().unwrap_or_default(),
