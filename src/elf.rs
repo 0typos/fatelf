@@ -242,3 +242,174 @@ fn checked_header_length<H: FileHeader>(header: &H) -> Result<usize, Error> {
     }
     Ok(size_of::<H>())
 }
+
+#[cfg(all(test, feature = "builder"))]
+mod tests {
+    use std::{fs, io::Write};
+
+    use object::{Endian, elf, pod};
+
+    use super::*;
+
+    /// Build an ELF header using the field types of the object reader.
+    fn header64(machine: u16, endian: Endianness) -> FileHeader64<Endianness> {
+        let mut header = *pod::from_bytes::<FileHeader64<Endianness>>(&[0; 64])
+            .unwrap()
+            .0;
+        header.e_ident.magic = elf::ELFMAG;
+        header.e_ident.class = elf::ELFCLASS64;
+        header.e_ident.data = if endian.is_little_endian() {
+            elf::ELFDATA2LSB
+        } else {
+            elf::ELFDATA2MSB
+        };
+        header.e_ident.version = elf::EV_CURRENT;
+        header.e_version.set(endian, u32::from(elf::EV_CURRENT));
+        header.e_ehsize.set(endian, 64);
+        header.e_type.set(endian, elf::ET_EXEC);
+        header.e_machine.set(endian, machine);
+        header.e_entry.set(endian, 1);
+        header
+    }
+
+    #[test]
+    fn executable_requires_matching_machine_and_byte_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input");
+        let little = Endianness::Little;
+        fs::write(&path, pod::bytes_of(&header64(elf::EM_X86_64, little))).unwrap();
+        let launcher = Elf::read(&path).unwrap();
+        let launcher_metadata = ElfMetadata::read(&path, 64, false).unwrap();
+        for (machine, endian, expected) in [
+            (elf::EM_X86_64, little, true),
+            (elf::EM_AARCH64, little, false),
+            (elf::EM_X86_64, Endianness::Big, false),
+        ] {
+            fs::write(&path, pod::bytes_of(&header64(machine, endian))).unwrap();
+            let elf = Elf::read(&path).unwrap();
+            let metadata = ElfMetadata::read(&path, 64, false).unwrap();
+            assert_eq!(elf.matches(&launcher), expected, "{machine}/{endian:?}");
+            assert_eq!(
+                metadata.matches(&launcher_metadata),
+                expected,
+                "{machine}/{endian:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_bound_includes_the_limit_and_checks_bytes_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input");
+        let header = header64(elf::EM_X86_64, Endianness::Little);
+        let mut bytes = pod::bytes_of(&header).to_vec();
+        bytes.extend_from_slice(b"tail");
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            Elf::read_bounded(&path, bytes.len() as u64)
+                .ok()
+                .unwrap()
+                .bytes,
+            bytes
+        );
+        assert!(Elf::read_bounded(&path, bytes.len() as u64 - 1).is_err());
+
+        // Procfs reports a zero file size even though the read returns data.
+        let error = Elf::read_bounded(Path::new("/proc/self/cmdline"), 1)
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "ELF exceeds input budget");
+        let error = Elf::read(directory.path()).err().unwrap();
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn relocatable_elf_is_rejected_even_with_a_nonzero_entry_point() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("relocatable");
+        let mut header = header64(elf::EM_X86_64, Endianness::Little);
+        header.e_type.set(Endianness::Little, elf::ET_REL);
+        fs::write(&path, pod::bytes_of(&header)).unwrap();
+        assert!(Elf::read(&path).is_err());
+    }
+
+    #[test]
+    fn doctor_reads_metadata_that_exceeds_one_mib() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large-section-table");
+        let endian = Endianness::Little;
+        let mut header = header64(elf::EM_X86_64, endian);
+        let sections = 20_000_u16;
+        header.e_shoff.set(endian, 64);
+        header.e_shentsize.set(endian, 64);
+        header.e_shnum.set(endian, sections);
+        header.e_shstrndx.set(endian, 1);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(pod::bytes_of(&header)).unwrap();
+        file.write_all(&[0; 64]).unwrap();
+        let strings_offset = 64 + u64::from(sections) * 64;
+        let mut names = *pod::from_bytes::<elf::SectionHeader64<Endianness>>(&[0; 64])
+            .unwrap()
+            .0;
+        names.sh_type.set(endian, elf::SHT_STRTAB);
+        names.sh_offset.set(endian, strings_offset);
+        names.sh_size.set(endian, 1);
+        file.write_all(pod::bytes_of(&names)).unwrap();
+        let length = strings_offset + 1;
+        file.set_len(length).unwrap();
+        let metadata = ElfMetadata::read(&path, length, false).unwrap();
+        assert_eq!(metadata.architecture, Architecture::X86_64);
+    }
+
+    #[test]
+    fn doctor_reads_the_elf32_interpreter_segment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("elf32");
+        let endian = Endianness::Little;
+        let mut header = *pod::from_bytes::<FileHeader32<Endianness>>(&[0; 52])
+            .unwrap()
+            .0;
+        header.e_ident.magic = elf::ELFMAG;
+        header.e_ident.class = elf::ELFCLASS32;
+        header.e_ident.data = elf::ELFDATA2LSB;
+        header.e_ident.version = elf::EV_CURRENT;
+        header.e_version.set(endian, u32::from(elf::EV_CURRENT));
+        header.e_ehsize.set(endian, 52);
+        header.e_type.set(endian, elf::ET_EXEC);
+        header.e_machine.set(endian, elf::EM_386);
+        header.e_phoff.set(endian, 52);
+        header.e_phnum.set(endian, 1);
+        header.e_phentsize.set(endian, 32);
+        let mut segment = *pod::from_bytes::<elf::ProgramHeader32<Endianness>>(&[0; 32])
+            .unwrap()
+            .0;
+        let interpreter = b"/test/ld.so\0";
+        segment.p_type.set(endian, elf::PT_INTERP);
+        segment.p_offset.set(endian, 84);
+        segment.p_filesz.set(endian, interpreter.len() as u32);
+        let bytes = [pod::bytes_of(&header), pod::bytes_of(&segment), interpreter].concat();
+        fs::write(&path, &bytes).unwrap();
+        let metadata = ElfMetadata::read(&path, bytes.len() as u64, false)
+            .ok()
+            .unwrap();
+        assert_eq!(
+            metadata.interpreter.as_deref(),
+            Some(b"/test/ld.so".as_slice())
+        );
+    }
+
+    #[test]
+    fn metadata_string_reads_accept_eof_and_reject_out_of_file_ranges() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"prefix\0suffix\0").unwrap();
+        let cache = ReadCache::new(file);
+        let budget = Cell::new(128);
+        let input = MetadataReader(&cache, &budget);
+        assert_eq!(
+            input.read_bytes_at_until(7..14, 0),
+            Ok(b"suffix".as_slice())
+        );
+        assert_eq!(input.read_bytes_at_until(0..7, 0), Ok(b"prefix".as_slice()));
+        assert!(input.read_bytes_at_until(7..15, 0).is_err());
+    }
+}
