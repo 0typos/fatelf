@@ -46,6 +46,7 @@ release target="x86_64-unknown-linux-musl":
 # Host-neutral release gate for an x86-64 Linux runner.
 release-check: ci fuzz fuzz-config release
     bash tests/release-smoke target/x86_64-unknown-linux-musl/release
+    bash tests/release-profiles
 
 # Resource and mount checks using the existing x86-64 static release pair.
 release-operations:

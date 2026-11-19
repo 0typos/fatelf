@@ -26,8 +26,9 @@
 - Static executables and dynamically linked executables, including PIE, can be
   packed. The host must support the chosen ELF's ABI/ISA and have its interpreter,
   shared libraries, and external resources. Those dependencies are not bundled.
-  ELF relocatable objects and non-ELF files are rejected; an ELF shared object is
-  not necessarily runnable even though its `ET_DYN` type also describes PIE.
+  ELF relocatable objects, non-ELF files, and zero-entry x86-64 ELFs are
+  rejected when packing. An `ET_DYN` file with an entry point still needs
+  a compatible host and loader.
 - Raw Unix argument bytes and environment values, working directory, PID,
   inherited descriptors, and exit/signal termination semantics are retained.
   `argv[0]` remains the invocation of the combined binary. Test the intended
@@ -54,7 +55,10 @@ fatelf doctor --config bundle.toml --json --probe
 
 `doctor` checks the config, launcher descriptor, payload compatibility with
 the launcher, ELF interpreter paths, temporary storage, and output destination
-on the current host. It creates no bundle, reads no key files, and runs no
+on the current host. The ELF metadata read budget is 16 MiB per input.
+An output directory may be writable on a `noexec` mount. In that case the
+output check describes the restriction while allowing staging there.
+`doctor` creates no bundle, reads no key files, and runs no
 payload. `--probe` also creates and closes an empty executable memfd if the
 config selects that backend. The probe does not attempt `execveat`.
 
@@ -74,7 +78,8 @@ and to check whether the chosen codecs fit the supplied launcher. Use
 `fatelf verify ./combined` reconstructs every payload into a discard stream
 and checks its digest without executing it or writing extracted files. Supply
 every required runtime key file through the configured environment variables.
-Successful verification exits silently. `fatelf inspect` reports metadata
+Successful verification exits silently. Verification work scales with the
+logical bytes across all payloads, including aliases of deduplicated objects. `fatelf inspect` reports metadata
 without reading payload data.
 
 ## Security boundaries

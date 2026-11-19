@@ -3,11 +3,18 @@
 use std::{
     env,
     io::{self, IsTerminal},
+    mem::{MaybeUninit, zeroed},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
+use clap::ValueEnum;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
@@ -53,7 +60,8 @@ pub(crate) fn run(input: Option<&Path>, output: Option<&Path>) -> Result<(), Err
         draft.launcher = Some(env::current_exe()?.with_file_name("fatelf-launcher"));
     }
     let mut builder = Builder::new(draft)?;
-    let outcome = {
+    let termination = Termination::install()?;
+    let outcome = (|| {
         let mut session = Session::new()?;
         let outcome = edit(
             &mut session.terminal,
@@ -62,8 +70,14 @@ pub(crate) fn run(input: Option<&Path>, output: Option<&Path>) -> Result<(), Err
             document.as_ref(),
         )?;
         session.finish()?;
-        outcome
-    };
+        Ok::<_, Error>(outcome)
+    })();
+    if termination.finish() {
+        // Restore the prior disposition first so supervisors see normal termination.
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)?;
+        return Ok(());
+    }
+    let outcome = outcome?;
     let Some(build) = outcome else { return Ok(()) };
     println!("Saved {}", path.display());
     if !build {
@@ -77,6 +91,64 @@ pub(crate) fn run(input: Option<&Path>, output: Option<&Path>) -> Result<(), Err
         .arg(&path)
         .exec();
     Err(error.into())
+}
+
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+static EDITOR_SIGNAL: Mutex<()> = Mutex::new(());
+
+extern "C" fn handle_sigterm(_: libc::c_int) {
+    TERMINATED.store(true, Ordering::Relaxed);
+}
+
+/// Restore the prior process-wide SIGTERM disposition when the editor leaves.
+struct Termination {
+    previous: Option<libc::sigaction>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Termination {
+    /// Install a handler that records only an atomic flag for the editor loop.
+    fn install() -> Result<Self, Error> {
+        let lock = EDITOR_SIGNAL
+            .try_lock()
+            .map_err(|_| Error::Invalid("terminal editor already active".into()))?;
+        TERMINATED.store(false, Ordering::Relaxed);
+        // SAFETY: sigaction is a C struct of scalar fields and a signal set.
+        let mut action: libc::sigaction = unsafe { zeroed() };
+        action.sa_sigaction = handle_sigterm as *const () as usize;
+        let mut previous = MaybeUninit::uninit();
+        // SAFETY: action is initialized, sigemptyset initializes its mask, and
+        // sigaction writes the old disposition to previous on success.
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGTERM, &action, previous.as_mut_ptr()) != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            Ok(Self {
+                previous: Some(previous.assume_init()),
+                _lock: lock,
+            })
+        }
+    }
+    /// Restore the previous action before checking the flag under the editor lock.
+    fn finish(mut self) -> bool {
+        self.restore();
+        TERMINATED.load(Ordering::Relaxed)
+    }
+
+    /// Restore the saved disposition once, including on unwind.
+    fn restore(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            // SAFETY: previous was returned by sigaction for this signal.
+            unsafe { libc::sigaction(libc::SIGTERM, &previous, std::ptr::null_mut()) };
+        }
+    }
+}
+
+impl Drop for Termination {
+    fn drop(&mut self) {
+        self.restore();
+    }
 }
 
 /// Own terminal restoration on successful completion, errors, and unwinding.
@@ -129,7 +201,20 @@ fn edit(
 ) -> Result<Option<bool>, Error> {
     loop {
         terminal.draw(|frame| builder.draw(frame, path))?;
-        let Event::Key(key) = event::read()? else {
+        let event = loop {
+            if TERMINATED.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            match event::poll(Duration::from_millis(100))
+                .and_then(|ready| ready.then(event::read).transpose())
+            {
+                Ok(Some(event)) => break event,
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let Event::Key(key) = event else {
             continue;
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -292,18 +377,33 @@ impl Field {
     }
 
     /// Enumerated choices cycled directly without free-form string parsing.
-    fn choices(self) -> &'static [&'static str] {
-        match self {
-            Self::Backend => &["memfd", "file"],
-            Self::Order => &["ordered", "shuffled"],
-            Self::Dedup => &["false", "true"],
+    fn choices(self) -> Vec<String> {
+        let choices = match self {
+            Self::Backend => return enum_choices::<Backend>(),
+            Self::Order => return enum_choices::<Order>(),
+            Self::ManifestPosition => return enum_choices::<Position>(),
+            Self::Compression => return enum_choices::<Compression>(),
+            Self::Dedup => &["false", "true"][..],
             Self::Scope => &["all", "sections", "ranges"],
-            Self::ManifestPosition => &["end", "front"],
-            Self::Compression => &["none", "lz4"],
             Self::PayloadShuffle(_) => &["inherit", "false", "true"],
             _ => &[],
-        }
+        };
+        choices.iter().map(|choice| (*choice).to_owned()).collect()
     }
+}
+
+/// Return the same user-facing value names Clap accepts.
+fn enum_choices<T: ValueEnum>() -> Vec<String> {
+    T::value_variants().iter().map(enum_name).collect()
+}
+
+/// Display the canonical spelling for an editor enum.
+fn enum_name(value: &impl ValueEnum) -> String {
+    value
+        .to_possible_value()
+        .expect("invariant: editor enum variants have names")
+        .get_name()
+        .to_owned()
 }
 
 /// Strict TOML string array used by the scope editor without delimiter ambiguity.
@@ -383,32 +483,16 @@ impl Builder {
                 .unwrap_or_default(),
             Field::Env => self.config.selection.env.clone(),
             Field::Default => self.config.selection.default.clone().unwrap_or_default(),
-            Field::Backend => match self.config.execution.backend {
-                Backend::Memfd => "memfd",
-                Backend::File => "file",
-            }
-            .into(),
+            Field::Backend => enum_name(&self.config.execution.backend),
             Field::Layout => "overlay".into(),
-            Field::Order => match self.config.storage.order {
-                Order::Ordered => "ordered",
-                Order::Shuffled => "shuffled",
-            }
-            .into(),
+            Field::Order => enum_name(&self.config.storage.order),
             Field::Dedup => self.config.storage.dedup.to_string(),
             Field::ChunkSize => self.config.storage.chunk_size.to_string(),
             Field::Seed => self.config.storage.seed.to_string(),
             Field::Scope => self.scope.clone(),
             Field::Values => self.values.clone(),
-            Field::ManifestPosition => match self.config.storage.manifest_position {
-                Position::Front => "front",
-                Position::End => "end",
-            }
-            .into(),
-            Field::Compression => match self.config.storage.compression {
-                Compression::None => "none",
-                Compression::Lz4 => "lz4",
-            }
-            .into(),
+            Field::ManifestPosition => enum_name(&self.config.storage.manifest_position),
+            Field::Compression => enum_name(&self.config.storage.compression),
             Field::PayloadShuffle(index) => self.config.payloads[index]
                 .shuffle
                 .map_or("inherit".into(), |v| v.to_string()),
@@ -434,18 +518,12 @@ impl Builder {
                 self.config.selection.default = (!value.is_empty()).then(|| value.into())
             }
             Field::Backend => {
-                self.config.execution.backend = match value {
-                    "memfd" => Backend::Memfd,
-                    "file" => Backend::File,
-                    _ => return Err(Error::Invalid("invalid backend".into())),
-                }
+                self.config.execution.backend =
+                    ValueEnum::from_str(value, false).map_err(Error::Invalid)?;
             }
             Field::Order => {
-                self.config.storage.order = match value {
-                    "ordered" => Order::Ordered,
-                    "shuffled" => Order::Shuffled,
-                    _ => return Err(Error::Invalid("invalid chunk order".into())),
-                }
+                self.config.storage.order =
+                    ValueEnum::from_str(value, false).map_err(Error::Invalid)?;
             }
             Field::Dedup => {
                 self.config.storage.dedup = value
@@ -465,18 +543,12 @@ impl Builder {
             Field::Scope => self.scope = value.into(),
             Field::Values => self.values = value.into(),
             Field::ManifestPosition => {
-                self.config.storage.manifest_position = match value {
-                    "front" => Position::Front,
-                    "end" => Position::End,
-                    _ => return Err(Error::Invalid("invalid manifest position".into())),
-                }
+                self.config.storage.manifest_position =
+                    ValueEnum::from_str(value, false).map_err(Error::Invalid)?;
             }
             Field::Compression => {
-                self.config.storage.compression = match value {
-                    "none" => Compression::None,
-                    "lz4" => Compression::Lz4,
-                    _ => return Err(Error::Invalid("invalid compression".into())),
-                }
+                self.config.storage.compression =
+                    ValueEnum::from_str(value, false).map_err(Error::Invalid)?;
             }
             Field::PayloadShuffle(index) => {
                 self.config.payloads[index].shuffle = match value {
@@ -524,16 +596,17 @@ impl Builder {
         if choices.is_empty() {
             return Ok(());
         }
+        let value = self.value(field);
         let current = choices
             .iter()
-            .position(|v| *v == self.value(field))
+            .position(|choice| choice == &value)
             .unwrap_or(0);
         let next = if forward {
             (current + 1) % choices.len()
         } else {
             (current + choices.len() - 1) % choices.len()
         };
-        self.set(field, choices[next])
+        self.set(field, &choices[next])
     }
 
     /// Add a named empty payload or remove its selected name/path pair.

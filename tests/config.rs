@@ -233,6 +233,7 @@ fn single_payload_front_manifest_plan_predicts_exact_output_size() {
         Some(1),
         "one payload must execute through a front manifest"
     );
+    assert!(executed.stderr.is_empty());
     let bytes = fs::read(&combined).unwrap();
     let launcher_length = fs::metadata(env!("CARGO_BIN_EXE_fatelf-launcher"))
         .unwrap()
@@ -316,6 +317,7 @@ fn encrypted_second_payload_uses_relative_external_key_without_gating_first() {
         Some(1),
         "decrypted false preserves its native exit status"
     );
+    assert!(second.stderr.is_empty());
     let extracted = configs.join("extracted");
     let recovered = Command::new(env!("CARGO_BIN_EXE_fatelf"))
         .args([
@@ -503,4 +505,42 @@ fn doctor_returns_json_for_an_invalid_configuration() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["ok"], false);
     assert_eq!(report["checks"][0]["code"], "config");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn doctor_and_build_reject_a_shared_library_without_an_entry_point() {
+    let directory = tempdir().unwrap();
+    let path = directory.path();
+    let source = path.join("library.c");
+    fs::write(&source, "int exported(void) { return 0; }\n").unwrap();
+    success(
+        &Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(path.join("library.so"))
+            .arg(source)
+            .output()
+            .unwrap(),
+    );
+    let mut config = settings("combined");
+    config["payloads"] = json!([{"name": "library", "path": "library.so"}]);
+    config["selection"]["default"] = json!("library");
+    fs::write(
+        path.join("bundle.toml"),
+        toml::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    for command in ["doctor", "build"] {
+        let output = tool(
+            &[command.into(), "--config".into(), "bundle.toml".into()],
+            path,
+        );
+        assert!(
+            !output.status.success(),
+            "{command} admitted a shared library"
+        );
+        let diagnostics = [output.stdout, output.stderr].concat();
+        assert!(String::from_utf8_lossy(&diagnostics).contains("no executable entry point"));
+    }
+    assert!(!path.join("combined").exists());
 }

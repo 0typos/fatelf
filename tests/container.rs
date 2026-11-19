@@ -405,13 +405,20 @@ fn existing_outputs_inputs_and_launcher_are_never_overwritten() {
     let directory = tempdir().unwrap();
     let existing = directory.path().join("existing");
     fs::write(&existing, b"keep this").unwrap();
-    for path in [
-        &existing,
-        &fixtures().a,
-        &PathBuf::from(env!("CARGO_BIN_EXE_fatelf-launcher")),
-    ] {
+    let payload = directory.path().join("input");
+    let launcher = directory.path().join("launcher");
+    fs::copy(&fixtures().a, &payload).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_fatelf-launcher"), &launcher).unwrap();
+    for path in [&existing, &payload, &launcher] {
         let before = fs::read(path).unwrap();
-        let attempted = pack(path, &[], false);
+        let attempted = tool(&[
+            "pack".into(),
+            format!("a={}", payload.display()).into(),
+            "--launcher".into(),
+            launcher.as_os_str().into(),
+            "-o".into(),
+            path.as_os_str().into(),
+        ]);
         assert!(!attempted.status.success());
         assert_eq!(fs::read(path).unwrap(), before);
     }

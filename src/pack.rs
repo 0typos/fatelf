@@ -160,10 +160,10 @@ pub(crate) struct PackOptions {
     /// Store objects in encounter order or shuffle contiguous eligible runs.
     #[arg(long, value_enum, default_value = "ordered")]
     pub(crate) order: Order,
-    /// Shuffle only these file-backed ELF sections; repeat for a union.
+    /// Shuffle only these file-backed ELF sections; each section must exist in every payload.
     #[arg(long, conflicts_with = "ranges", requires = "order")]
     pub(crate) section: Vec<String>,
-    /// Shuffle only START:END byte ranges; decimal or 0x hex, end exclusive.
+    /// Shuffle only START:END byte ranges; end exclusive, validated against every payload.
     #[arg(long = "range", conflicts_with = "section", requires = "order")]
     pub(crate) ranges: Vec<ByteRange>,
     /// Restrict global shuffle eligibility to these payload names; repeat as needed.
@@ -783,14 +783,14 @@ impl Pool {
                 "decoded object exceeds configured budget".into(),
             ));
         }
-        let key = CandidateKey {
+        let key = dedup.then(|| CandidateKey {
             hash: blake3::hash(bytes),
             encoding,
             compression: policy.compression,
             shuffle: policy.shuffle,
             encryption: policy.encryption.clone(),
-        };
-        if dedup && let Some(candidates) = self.candidates.get(&key) {
+        });
+        if let Some(candidates) = key.as_ref().and_then(|key| self.candidates.get(key)) {
             for &id in candidates {
                 let object = &self.objects[id];
                 if object.decoded_length != bytes.len() as u64 {
@@ -823,7 +823,7 @@ impl Pool {
             encoding,
             policy: policy.clone(),
         });
-        if dedup {
+        if let Some(key) = key {
             self.candidates.entry(key).or_default().push(id);
         }
         Ok(id)
@@ -975,4 +975,21 @@ pub(crate) fn extract(input: &Path, name: &str, output: &Path) -> Result<(), Err
     let mut scratch = new_output(output)?;
     container.reconstruct(index, &mut scratch)?;
     finish_output(scratch, output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn destination_created_after_staging_is_not_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bundle");
+        let mut output = new_output(&path).unwrap();
+        output.write_all(b"staged bundle").unwrap();
+        fs::write(&path, b"another writer").unwrap();
+        assert!(finish_output(output, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"another writer");
+    }
 }

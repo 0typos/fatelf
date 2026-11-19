@@ -50,7 +50,11 @@ Encoding is header XOR `0xA5`, then optional compression, then optional AEAD.
 Raw fallback retains the masked header. Decode authenticates first, decompresses
 into an exact bounded buffer, reverses header masking, validates the header,
 and verifies the original digest before execution/publication. AEAD associated
-data binds the exact manifest digest and unique object index to a fixed v2 domain.
+data is exactly 57 bytes: the 17-byte ASCII domain `fatelf-v2-object\0`
+(including the terminating NUL), the 32 manifest-hash bytes from the footer,
+and the zero-based index in `manifest.chunks` as a little-endian u64.
+The stored object is XChaCha20-Poly1305 ciphertext followed by its 16-byte
+authentication tag. The recorded object length includes the tag.
 Nonces/lengths/offsets are finalized before encryption; ciphertext tags are not
 manifest fields, avoiding a circular commitment.
 

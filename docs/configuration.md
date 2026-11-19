@@ -19,7 +19,8 @@ key sources and budgets are edited in TOML and preserved by the TUI; their
 creation is not yet a guided wizard. Save As resolves referenced paths before
 moving the config. Structured saves replace comments and formatting. An in-place save checks
 that the loaded file still has the same contents just before replacement.
-Fatelf serializes in-place saves with an advisory directory lock and reports
+Fatelf preserves ownership, read/write mode, and the POSIX access ACL of an
+in-place config and serializes saves with an advisory directory lock and reports
 contention so you can retry. Coordinate edits with other tools yourself.
 For a separate copy, run `configure --config OLD --output NEW`.
 
@@ -110,7 +111,7 @@ Attach region tables immediately after their intended payload. Conflicting
 effective policies on overlapping bytes are rejected; identical overlaps merge.
 No region boundary may split the complete mandatory header. `shuffle = true`
 requires shuffled storage order. Global `storage.sections`/`ranges` (CLI
-`--section`/`--range`) remain supported as shuffle scopes; at most 1024 scopes
+`--section`/`--range`) are validated against every payload, including unselected ones. At most 1024 scopes
 and 1024 region rules per payload are accepted.
 
 Deduplication compares original bytes after BLAKE3 candidate lookup. Sharing
@@ -155,4 +156,6 @@ Launcher input has a separate 1 GiB ceiling. Temporary output length is bounded
 by launcher + stored pool + manifest + footer. Build/extract publication is
 atomic and refuses existing paths. Small chunks increase manifest size. If a
 large payload hits the manifest budget first, try a larger chunk size before
-raising that budget.
+raising that budget. Larger chunks also reduce per-object launch overhead but
+may reduce deduplication across similar inputs. Measure both bundle size and
+startup time with the intended workload.

@@ -5,6 +5,9 @@ use crate::error::Error;
 #[cfg(feature = "builder")]
 use object::{Object, ObjectSection};
 
+const COMPRESSION: u8 = 1;
+const ENCRYPTION: u8 = 2;
+
 /// Allocated descriptor survives stripping; the entrypoint references it as well.
 #[used]
 #[unsafe(link_section = ".fatelf")]
@@ -17,7 +20,8 @@ static DESCRIPTOR: [u8; 16] = [
     b'P',
     b'0',
     b'2',
-    (cfg!(feature = "compression") as u8) | ((cfg!(feature = "encryption") as u8) << 1),
+    (cfg!(feature = "compression") as u8 * COMPRESSION)
+        | (cfg!(feature = "encryption") as u8 * ENCRYPTION),
     0,
     0,
     0,
@@ -39,9 +43,8 @@ pub(crate) fn validate_launcher(
     compression: bool,
     encryption: bool,
 ) -> Result<(), Error> {
-    let supported = launcher_codecs(bytes)?;
-    let required = u8::from(compression) | (u8::from(encryption) << 1);
-    if supported & required != required {
+    let supported = launcher_codecs(&object::File::parse(bytes)?)?;
+    if (compression && !supported.compression) || (encryption && !supported.encryption) {
         return Err(Error::Invalid(
             "launcher does not support the selected codecs".into(),
         ));
@@ -49,26 +52,40 @@ pub(crate) fn validate_launcher(
     Ok(())
 }
 
-/// Read the launcher capability bits without executing it.
+/// Named decoder support declared by a launcher.
 #[cfg(feature = "builder")]
-pub(crate) fn launcher_codecs(bytes: &[u8]) -> Result<u8, Error> {
-    let elf = object::File::parse(bytes)?;
+pub(crate) struct LauncherCodecs {
+    pub(crate) compression: bool,
+    pub(crate) encryption: bool,
+}
+
+/// Read the launcher descriptor without executing it.
+#[cfg(feature = "builder")]
+pub(crate) fn launcher_codecs<'data>(elf: &impl Object<'data>) -> Result<LauncherCodecs, Error> {
     let mut sections = elf
         .sections()
         .filter(|section| section.name() == Ok(".fatelf"));
-    let descriptor = sections
+    let section = sections
         .next()
-        .ok_or_else(|| Error::Invalid("launcher lacks v2 capability descriptor".into()))?
-        .data()?;
+        .ok_or_else(|| Error::Invalid("launcher lacks v2 capability descriptor".into()))?;
+    if section.size() != DESCRIPTOR.len() as u64 {
+        return Err(Error::Invalid(
+            "invalid launcher capability descriptor".into(),
+        ));
+    }
+    let descriptor = section.data()?;
     if sections.next().is_some()
         || descriptor.len() != 16
         || &descriptor[..8] != b"FATCAP02"
-        || descriptor[8] & !3 != 0
+        || descriptor[8] & !(COMPRESSION | ENCRYPTION) != 0
         || descriptor[9..].iter().any(|&byte| byte != 0)
     {
         return Err(Error::Invalid(
             "invalid launcher capability descriptor".into(),
         ));
     }
-    Ok(descriptor[8])
+    Ok(LauncherCodecs {
+        compression: descriptor[8] & COMPRESSION != 0,
+        encryption: descriptor[8] & ENCRYPTION != 0,
+    })
 }

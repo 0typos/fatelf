@@ -1,15 +1,19 @@
 //! Strict TOML build settings shared by handwritten configurations and the TUI.
 
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
 use rustix::{
-    fs::{FlockOperation, flock},
+    fs::{
+        FlockOperation, XattrFlags, fchown, fgetxattr, fgetxattr_query, flock, fremovexattr,
+        fsetxattr,
+    },
     io::Errno,
+    process::{Gid, Uid},
 };
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
@@ -258,7 +262,7 @@ impl Document {
     /// Read only a bounded regular file and resolve symlinked configs consistently.
     pub(crate) fn load(path: &Path) -> Result<Self, Error> {
         let path = fs::canonicalize(path)?;
-        let bytes = read_config(&path)?;
+        let (bytes, _) = read_config(&path)?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|_| Error::Invalid("configuration must be UTF-8".into()))?;
         Ok(Self {
@@ -282,8 +286,8 @@ impl Document {
 }
 
 /// Read a bounded configuration snapshot without following a replacement symlink.
-fn read_config(path: &Path) -> Result<Vec<u8>, Error> {
-    let file = OpenOptions::new()
+fn read_config(path: &Path) -> Result<(Vec<u8>, File), Error> {
+    let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)?;
@@ -294,11 +298,13 @@ fn read_config(path: &Path) -> Result<Vec<u8>, Error> {
         ));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_CONFIG as u64 + 1).read_to_end(&mut bytes)?;
+    (&mut file)
+        .take(MAX_CONFIG as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_CONFIG {
         return Err(Error::Invalid("configuration exceeds 1 MiB".into()));
     }
-    Ok(bytes)
+    Ok((bytes, file))
 }
 
 /// Resolve relative path fields using their document's directory.
@@ -334,7 +340,6 @@ pub(crate) fn save(
         .ok_or_else(|| Error::Invalid("configuration output has no parent directory".into()))?;
     let mut scratch = NamedTempFile::new_in(parent)?;
     scratch.write_all(text.as_bytes())?;
-    scratch.as_file().sync_all()?;
     if let Some(original) = original.filter(|document| document.path == path) {
         // The directory inode survives atomic replacement of the config.
         let directory = fs::File::open(parent)?;
@@ -345,24 +350,58 @@ pub(crate) fn save(
                 error.into()
             }
         })?;
-        let current = read_config(path)?;
+        let (current, source) = read_config(path)?;
         if blake3::hash(&current) != original.fingerprint {
             return Err(Error::Invalid(format!(
                 "configuration {} changed since it was loaded; reload or save to a new path",
                 path.display()
             )));
         }
+        preserve_access(&source, scratch.as_file())?;
+        scratch.as_file().sync_all()?;
         scratch.persist(path).map_err(|e| e.error)?;
     } else {
+        scratch.as_file().sync_all()?;
         scratch.persist_noclobber(path).map_err(|e| e.error)?;
     }
+    Ok(())
+}
+
+/// Preserve access controls before replacing an existing configuration inode.
+fn preserve_access(source: &File, staged: &File) -> Result<(), Error> {
+    let original = source.metadata()?;
+    let new = staged.metadata()?;
+    let uid = (original.uid() != new.uid()).then(|| Uid::from_raw(original.uid()));
+    let gid = (original.gid() != new.gid()).then(|| Gid::from_raw(original.gid()));
+    if uid.is_some() || gid.is_some() {
+        fchown(staged, uid, gid)?;
+    }
+
+    const ACCESS_ACL: &str = "system.posix_acl_access";
+    match fgetxattr_query(source, ACCESS_ACL) {
+        Ok(size) => {
+            let mut acl = vec![0; size];
+            let read = fgetxattr(source, ACCESS_ACL, acl.as_mut_slice())?;
+            fsetxattr(staged, ACCESS_ACL, &acl[..read], XattrFlags::empty())?;
+        }
+        Err(Errno::NODATA | Errno::NOTSUP) => {
+            // A new inode can inherit an ACL from its directory even if the old
+            // file had none. Remove it before chmod opens the group mask.
+            match fremovexattr(staged, ACCESS_ACL) {
+                Ok(()) | Err(Errno::NODATA | Errno::NOTSUP) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    staged.set_permissions(fs::Permissions::from_mode(original.mode() & 0o666))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     /// Valid settings with relative references exercise relocation without reading ELFs.
@@ -419,6 +458,11 @@ mod tests {
         let path = directory.path().join("bundle.toml");
         let mut config = settings();
         save(&config, &path, None).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
         let before = fs::read(&path).unwrap();
         config.selection.env = "APP_MODE".into();
         assert!(save(&config, &path, None).is_err());
@@ -426,7 +470,10 @@ mod tests {
         let document = Document::load(&path).unwrap();
         save(&config, &path, Some(&document)).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), config.encode().unwrap());
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o111, 0);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         let link = directory.path().join("link.toml");
         symlink(&path, &link).unwrap();
         assert!(save(&config, &link, Some(&document)).is_err());

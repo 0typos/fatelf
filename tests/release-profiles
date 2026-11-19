@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Exercise the codec-restricted launcher profiles with the static packer.
+set -euo pipefail
+repo=$(pwd -P)
+bin_dir="$repo/target/x86_64-unknown-linux-musl/release"
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT
+unset FATELF_VARIANT
+cp /usr/bin/true "$scratch/payload"
+truncate -s +65536 "$scratch/payload"
+
+for profile in core compression encryption; do
+    features=$profile
+    if [[ "$profile" == core ]]; then features=; fi
+    just launcher "$features"
+    launcher="target/x86_64-unknown-linux-musl/launcher/fatelf-launcher"
+    flags=()
+    if [[ "$profile" == compression ]]; then flags=(--compression lz4); fi
+    if [[ "$profile" == encryption ]]; then
+        cp "$launcher" "$scratch/launcher"
+        (umask 077; head -c 32 /dev/urandom > "$scratch/key")
+        cat > "$scratch/encrypted.toml" <<TOML
+version = 2
+output = "$profile"
+launcher = "launcher"
+
+[[keys]]
+name = "test"
+key_file = "key"
+env = "FATELF_PROFILE_KEY"
+
+[[payloads]]
+name = "yes"
+path = "/usr/bin/true"
+encryption = "test"
+TOML
+        "$bin_dir/fatelf" build --config "$scratch/encrypted.toml"
+        FATELF_PROFILE_KEY="$scratch/key" "$scratch/$profile"
+    else
+        "$bin_dir/fatelf" pack yes="$scratch/payload" --launcher "$launcher" \
+            -o "$scratch/$profile" "${flags[@]}"
+        "$scratch/$profile"
+    fi
+    if [[ "$profile" == core ]]; then
+        status=0
+        "$bin_dir/fatelf" pack yes="$scratch/payload" --launcher "$launcher" \
+            --compression lz4 -o "$scratch/unsupported" > "$scratch/error" 2>&1 || status=$?
+        test "$status" -eq 1
+        grep -Fq 'launcher does not support the selected codecs' "$scratch/error"
+        test ! -e "$scratch/unsupported"
+    fi
+done

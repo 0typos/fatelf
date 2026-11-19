@@ -60,6 +60,11 @@ unshare --user --map-root-user --mount --propagation private bash -euo pipefail 
     test "$status" -eq 1
     grep -q "file backend cannot execute on a noexec mount" noexec.json
 
+    printf "%s\n" "version = 2" "output = \"mount/staged\"" \
+        "[[payloads]]" "name = \"run\"" "path = \"/usr/bin/true\"" > staging.toml
+    TMPDIR="$PWD" "$1" doctor --config staging.toml --json > noexec-staging.json
+    grep -q "noexec mount cannot run local bundles" noexec-staging.json
+
     status=0
     LC_ALL=C "$1" build --config operational.toml > full.stderr 2>&1 || status=$?
     test "$status" -eq 1

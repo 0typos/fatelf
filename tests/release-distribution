@@ -13,11 +13,12 @@ fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1=="fpr" 
 gpg --batch --export "$fingerprint" > "$scratch/trusted.gpg"
 
 cd "$scratch"
-mkdir -p docs/release tests fuzz/seeds/container target/x86_64-unknown-linux-musl/release unpacked
-cp "$repo/docs/release/package" "$repo/docs/release/verify-package" docs/release/
+mkdir -p docs/release tests/fixtures/v2 fuzz/seeds/container target/x86_64-unknown-linux-musl/release unpacked
+cp "$repo/docs/release/"{package,verify-package,binary-README.md} docs/release/
 cp "$repo/tests/release-smoke" tests/
 cp "$repo/fuzz/seeds/container/v2" fuzz/seeds/container/
-cp "$repo/LICENSE" "$repo/README.md" .
+cp "$repo/tests/fixtures/v2/encrypted" tests/fixtures/v2/
+cp "$repo/LICENSE" .
 cp "$bin_dir/fatelf" "$bin_dir/fatelf-launcher" target/x86_64-unknown-linux-musl/release/
 printf '%s\n' 'Disposable notice fixture for the packaging test.' > fixture.notice
 release=$(bash docs/release/package fixture.notice "$fingerprint")
@@ -28,6 +29,15 @@ tar -xzf "$archive" -C unpacked
 cmp "$bin_dir/fatelf" "unpacked/${release##*/}/fatelf"
 cmp "$bin_dir/fatelf-launcher" "unpacked/${release##*/}/fatelf-launcher"
 cmp fixture.notice "unpacked/${release##*/}/NOTICE"
+cmp docs/release/binary-README.md "unpacked/${release##*/}/README.md"
+
+cp "$release/SHA256SUMS.sig" "$scratch/valid.sig"
+printf '%s\n' 'invalid signature' > "$release/SHA256SUMS.sig"
+if bash docs/release/verify-package "$scratch/trusted.gpg" "$archive"; then
+    echo "Verifier accepted a release with an invalid signature" >&2
+    exit 1
+fi
+mv "$scratch/valid.sig" "$release/SHA256SUMS.sig"
 
 cp "$archive" "$release/other.tar.gz"
 if bash docs/release/verify-package "$scratch/trusted.gpg" "$release/other.tar.gz"; then

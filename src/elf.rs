@@ -2,11 +2,18 @@
 
 use std::mem::size_of;
 #[cfg(feature = "builder")]
-use std::{fs::OpenOptions, io::Read, ops::Range, os::unix::fs::OpenOptionsExt, path::Path};
+use std::{
+    cell::Cell,
+    fs::{File, OpenOptions},
+    io::Read,
+    ops::Range,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+};
 
 #[cfg(feature = "builder")]
 use object::{
-    Architecture, BinaryFormat, Object, ObjectKind, ObjectSection,
+    Architecture, BinaryFormat, Object, ObjectKind, ObjectSection, ReadCache, ReadRef,
     read::elf::{ElfFile, ProgramHeader},
 };
 use object::{
@@ -37,17 +44,7 @@ impl Elf {
     /// Apply the build's size limit before allocating an input's bytes.
     pub(crate) fn read_bounded(path: &Path, max_bytes: u64) -> Result<Self, Error> {
         let limit = max_bytes.min(MAX_PAYLOAD);
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > limit {
-            return Err(Error::Invalid(format!(
-                "{} is not a regular file within the input budget",
-                path.display()
-            )));
-        }
+        let file = open_bounded(path, limit)?;
         let mut bytes = Vec::new();
         file.take(limit + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > limit {
@@ -55,14 +52,7 @@ impl Elf {
         }
         header_length(&bytes)?;
         let elf = object::File::parse(bytes.as_slice())?;
-        if elf.format() != BinaryFormat::Elf
-            || !matches!(elf.kind(), ObjectKind::Executable | ObjectKind::Dynamic)
-        {
-            return Err(Error::Invalid(format!(
-                "{} is not an executable ELF",
-                path.display()
-            )));
-        }
+        validate_executable(&elf, path)?;
         let architecture = elf.architecture();
         let little_endian = elf.is_little_endian();
         Ok(Self {
@@ -75,15 +65,6 @@ impl Elf {
     /// Compare the architecture and byte order used by the Linux execution path.
     pub(crate) fn matches(&self, launcher: &Self) -> bool {
         self.architecture == launcher.architecture && self.little_endian == launcher.little_endian
-    }
-
-    /// Read the interpreter named by the executable, when it has a PT_INTERP segment.
-    pub(crate) fn interpreter(&self) -> Result<Option<&[u8]>, Error> {
-        match object::File::parse(self.bytes.as_slice())? {
-            object::File::Elf32(file) => interpreter(&file),
-            object::File::Elf64(file) => interpreter(&file),
-            _ => Err(Error::Invalid("expected an ELF executable".into())),
-        }
     }
 
     /// Return the canonical complete ELF header that must be obscured in storage.
@@ -115,10 +96,121 @@ impl Elf {
     }
 }
 
+/// Open a bounded regular ELF input, including when a pathname names a FIFO.
+#[cfg(feature = "builder")]
+fn open_bounded(path: &Path, max_bytes: u64) -> Result<File, Error> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(Error::Invalid(format!(
+            "{} is not a regular file within the input budget",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+/// Check admission rules shared by packing and diagnostics.
+#[cfg(feature = "builder")]
+fn validate_executable<'data, R: ReadRef<'data>>(
+    elf: &object::File<'data, R>,
+    path: &Path,
+) -> Result<(), Error> {
+    if elf.format() != BinaryFormat::Elf
+        || !matches!(elf.kind(), ObjectKind::Executable | ObjectKind::Dynamic)
+    {
+        return Err(Error::Invalid(format!(
+            "{} is not an executable ELF",
+            path.display()
+        )));
+    }
+    if elf.architecture() == Architecture::X86_64 && elf.entry() == 0 {
+        return Err(Error::Invalid(format!(
+            "{} has no executable entry point",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// ELF diagnostics read only metadata and retain no payload body.
+#[cfg(feature = "builder")]
+pub(crate) struct ElfMetadata {
+    pub(crate) architecture: Architecture,
+    pub(crate) little_endian: bool,
+    pub(crate) interpreter: Option<Vec<u8>>,
+    pub(crate) codecs: Option<crate::capabilities::LauncherCodecs>,
+}
+
+#[cfg(feature = "builder")]
+impl ElfMetadata {
+    /// Load program headers and optional launcher capabilities through bounded cached reads.
+    pub(crate) fn read(path: &Path, max_bytes: u64, launcher: bool) -> Result<Self, Error> {
+        let cache = ReadCache::new(open_bounded(path, max_bytes.min(MAX_PAYLOAD))?);
+        let remaining = Cell::new(16 * 1024 * 1024);
+        let data = MetadataReader(&cache, &remaining);
+        let header = data
+            .len()
+            .and_then(|len| data.read_bytes_at(0, len.min(64)))
+            .map_err(|_| Error::Invalid("could not read ELF header".into()))?;
+        header_length(header)?;
+        let elf = object::File::parse(data)?;
+        validate_executable(&elf, path)?;
+        let interpreter = match &elf {
+            object::File::Elf32(file) => interpreter(file)?,
+            object::File::Elf64(file) => interpreter(file)?,
+            _ => None,
+        };
+        Ok(Self {
+            architecture: elf.architecture(),
+            little_endian: elf.is_little_endian(),
+            interpreter: interpreter.map(<[u8]>::to_vec),
+            codecs: launcher
+                .then(|| crate::capabilities::launcher_codecs(&elf))
+                .transpose()?,
+        })
+    }
+
+    /// Compare input and launcher execution architecture.
+    pub(crate) fn matches(&self, launcher: &Self) -> bool {
+        self.architecture == launcher.architecture && self.little_endian == launcher.little_endian
+    }
+}
+
+/// Cap metadata read requests before the underlying cache allocates a buffer.
+#[cfg(feature = "builder")]
+#[derive(Clone, Copy)]
+struct MetadataReader<'a>(&'a ReadCache<File>, &'a Cell<u64>);
+
+#[cfg(feature = "builder")]
+impl<'a> ReadRef<'a> for MetadataReader<'a> {
+    fn len(self) -> Result<u64, ()> {
+        self.0.len()
+    }
+
+    fn read_bytes_at(self, offset: u64, size: u64) -> Result<&'a [u8], ()> {
+        self.1.set(self.1.get().checked_sub(size).ok_or(())?);
+        self.0.read_bytes_at(offset, size)
+    }
+
+    fn read_bytes_at_until(self, range: Range<u64>, delimiter: u8) -> Result<&'a [u8], ()> {
+        if range.end > self.len()? {
+            return Err(());
+        }
+        let limit = range.end.checked_sub(range.start).ok_or(())?.min(4096);
+        self.1.set(self.1.get().checked_sub(limit).ok_or(())?);
+        self.0
+            .read_bytes_at_until(range.start..range.start + limit, delimiter)
+    }
+}
+
 /// Read PT_INTERP through the same object reader for ELF32 and ELF64.
 #[cfg(feature = "builder")]
-fn interpreter<'data, E: FileHeader>(
-    file: &ElfFile<'data, E>,
+fn interpreter<'data, E: FileHeader, R: ReadRef<'data>>(
+    file: &ElfFile<'data, E, R>,
 ) -> Result<Option<&'data [u8]>, Error> {
     for segment in file.elf_program_headers() {
         if let Some(path) = segment.interpreter(file.endian(), file.data())? {

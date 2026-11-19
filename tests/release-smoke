@@ -28,6 +28,22 @@ for name in fatelf fatelf-launcher; do
 done
 
 "$bin_dir/fatelf" verify "$repo_dir/fuzz/seeds/container/v2"
+head -c 32 /dev/zero > v2-test.key
+FATELF_COMPAT_KEY="$PWD/v2-test.key" "$bin_dir/fatelf" extract \
+    "$repo_dir/tests/fixtures/v2/encrypted" --variant sample -o v2-original
+printf '%s\n' 'da7b2884e1f5e790122eba7e440d5dd6df9201e0f6919df41aa03f6b9e633567  v2-original' | sha256sum --check --strict
+
+mkfifo input-fifo
+for command in inspect verify extract; do
+    args=()
+    if [[ "$command" == extract ]]; then args=(--variant sample -o fifo-output); fi
+    status=0
+    timeout 2 "$bin_dir/fatelf" "$command" input-fifo "${args[@]}" > fifo.log 2>&1 || status=$?
+    test "$status" -eq 1
+    grep -Fq 'not a regular container file' fifo.log
+done
+test ! -e fifo-output
+
 unset FATELF_VARIANT FATELF_SMOKE_KEY
 umask 077
 head -c 32 /dev/urandom > smoke.key

@@ -29,7 +29,8 @@ fi
 name="fatelf-${BASH_REMATCH[1]}-x86_64-unknown-linux-musl"
 archive="$name.tar.gz"
 mv -- "$scratch/tools" "$scratch/$name"
-install -m 0644 LICENSE README.md "$scratch/$name"
+install -m 0644 LICENSE "$scratch/$name"
+install -m 0644 docs/release/binary-README.md "$scratch/$name/README.md"
 install -m 0644 "$notice" "$scratch/$name/NOTICE"
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
     -C "$scratch" -cf - "$name" | gzip -n > "$scratch/release/$archive"

@@ -14,8 +14,12 @@ use rustix::{
 use serde::Serialize;
 
 use crate::{
-    capabilities::launcher_codecs, config::Document, container::Backend, elf::Elf, error::Error,
-    launch::executable_memfd, pack::output_parent,
+    config::Document,
+    container::{Backend, MAX_PAYLOAD},
+    elf::ElfMetadata,
+    error::Error,
+    launch::executable_memfd,
+    pack::output_parent,
 };
 
 /// Versioned operator diagnostics, with human-readable detail in either output mode.
@@ -41,23 +45,22 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
     match Document::load(config).and_then(|document| document.config.options(document.base())) {
         Ok(options) => {
             let launcher_path = options.launcher_path()?;
-            let launcher = Elf::read(&launcher_path).and_then(|elf| {
-                let codecs = launcher_codecs(&elf.bytes)?;
-                Ok((elf, codecs))
-            });
+            let launcher = ElfMetadata::read(&launcher_path, MAX_PAYLOAD, true);
             checks.push(check(
                 "launcher",
                 launcher_path.display().to_string(),
-                launcher.as_ref().map(|(elf, codecs)| {
+                launcher.as_ref().map(|elf| {
+                    let codecs = elf
+                        .codecs
+                        .as_ref()
+                        .expect("invariant: launcher read includes codecs");
                     format!(
                         "{:?}; v2; compression={}; encryption={}",
-                        elf.architecture,
-                        codecs & 1 != 0,
-                        codecs & 2 != 0
+                        elf.architecture, codecs.compression, codecs.encryption
                     )
                 }),
             ));
-            if let Ok((elf, _)) = &launcher {
+            if let Ok(elf) = &launcher {
                 checks.push(check(
                     "launcher_interpreter",
                     launcher_path.display().to_string(),
@@ -65,9 +68,9 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
                 ));
             }
             for input in &options.inputs {
-                let elf = Elf::read_bounded(&input.path, options.budgets.max_payload_bytes);
+                let elf = ElfMetadata::read(&input.path, options.budgets.max_payload_bytes, false);
                 let architecture = elf.as_ref().map_err(ToString::to_string).and_then(|elf| {
-                    if let Ok((launcher, _)) = &launcher
+                    if let Ok(launcher) = &launcher
                         && !elf.matches(launcher)
                     {
                         return Err(format!(
@@ -162,8 +165,8 @@ fn check(code: &'static str, subject: String, result: Result<String, impl ToStri
 }
 
 /// Check the path named by PT_INTERP without running a dependency lister.
-fn interpreter(elf: &Elf) -> Result<String, Error> {
-    let Some(bytes) = elf.interpreter()? else {
+fn interpreter(elf: &ElfMetadata) -> Result<String, Error> {
+    let Some(bytes) = elf.interpreter.as_deref() else {
         return Ok("no PT_INTERP segment".into());
     };
     let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
@@ -197,5 +200,11 @@ fn storage(path: &Path, executable: bool) -> Result<String, Error> {
     if available == 0 {
         return Err(Error::Invalid("filesystem has no available bytes".into()));
     }
-    Ok(format!("{available} bytes available"))
+    if stats.f_flag.contains(StatVfsMountFlags::NOEXEC) {
+        Ok(format!(
+            "{available} bytes available; noexec mount cannot run local bundles"
+        ))
+    } else {
+        Ok(format!("{available} bytes available"))
+    }
 }
