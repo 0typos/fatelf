@@ -13,6 +13,7 @@ use std::{
     sync::OnceLock,
 };
 
+use object::{Object, ObjectSection};
 use rustix::process::{Pid, Signal, kill_process};
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
@@ -421,6 +422,140 @@ fn existing_outputs_inputs_and_launcher_are_never_overwritten() {
         ]);
         assert!(!attempted.status.success());
         assert_eq!(fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn invalid_launcher_descriptor_is_rejected_without_creating_output() {
+    let directory = tempdir().unwrap();
+    let launcher = directory.path().join("launcher");
+    let payload = directory.path().join("payload");
+    let output = directory.path().join("combined");
+    let original = fs::read(env!("CARGO_BIN_EXE_fatelf-launcher")).unwrap();
+    let elf = object::File::parse(original.as_slice()).unwrap();
+    let (offset, _) = elf
+        .section_by_name(".fatelf")
+        .unwrap()
+        .file_range()
+        .unwrap();
+    let offset = usize::try_from(offset).unwrap();
+    fs::copy("/usr/bin/true", &payload).unwrap();
+    for (description, index, byte) in [
+        ("wrong version", 7, b'1'),
+        ("unknown codec", 8, 0x80),
+        ("nonzero reserved byte", 9, 1),
+    ] {
+        let mut bytes = original.clone();
+        bytes[offset + index] = byte;
+        fs::write(&launcher, bytes).unwrap();
+        let attempted = tool(&[
+            "pack".into(),
+            format!("sample={}", payload.display()).into(),
+            "--launcher".into(),
+            launcher.as_os_str().into(),
+            "-o".into(),
+            output.as_os_str().into(),
+        ]);
+        assert!(!attempted.status.success(), "{description}");
+        assert!(
+            String::from_utf8_lossy(&attempted.stderr)
+                .contains("invalid launcher capability descriptor"),
+            "{description}: {}",
+            String::from_utf8_lossy(&attempted.stderr),
+        );
+        assert!(!output.exists(), "{description}");
+    }
+}
+
+#[test]
+fn duplicate_launcher_descriptor_is_rejected() {
+    let directory = tempdir().unwrap();
+    let launcher = directory.path().join("launcher");
+    let output = directory.path().join("combined");
+    let mut bytes = fs::read(env!("CARGO_BIN_EXE_fatelf-launcher")).unwrap();
+    let elf = object::File::parse(bytes.as_slice()).unwrap();
+    let capabilities = elf.section_by_name(".fatelf").unwrap();
+    let duplicate = elf.section_by_name(".symtab").unwrap();
+    assert!(duplicate.index().0 > capabilities.index().0);
+    let names = elf.section_by_name(".shstrtab").unwrap();
+    let (offset, _) = names.file_range().unwrap();
+    let name_offset = names
+        .data()
+        .unwrap()
+        .windows(8)
+        .position(|name| name == b".symtab\0")
+        .unwrap();
+    let name_offset = usize::try_from(offset).unwrap() + name_offset;
+    bytes[name_offset..name_offset + 8].copy_from_slice(b".fatelf\0");
+    fs::write(&launcher, bytes).unwrap();
+
+    let attempted = tool(&[
+        "pack".into(),
+        "sample=/usr/bin/true".into(),
+        "--launcher".into(),
+        launcher.into_os_string(),
+        "-o".into(),
+        output.as_os_str().into(),
+    ]);
+    assert!(!attempted.status.success());
+    assert!(
+        String::from_utf8_lossy(&attempted.stderr)
+            .contains("invalid launcher capability descriptor")
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn build_respects_each_declared_launcher_codec() {
+    let directory = tempdir().unwrap();
+    let launcher = directory.path().join("launcher");
+    let payload = directory.path().join("payload");
+    let config = directory.path().join("bundle.toml");
+    let key = directory.path().join("key");
+    fs::write(&key, [13; 32]).unwrap();
+    fs::copy("/usr/bin/true", &payload).unwrap();
+    let input = fs::OpenOptions::new().write(true).open(&payload).unwrap();
+    input
+        .set_len(input.metadata().unwrap().len() + 65536)
+        .unwrap();
+
+    let original = fs::read(env!("CARGO_BIN_EXE_fatelf-launcher")).unwrap();
+    let elf = object::File::parse(original.as_slice()).unwrap();
+    let (offset, _) = elf
+        .section_by_name(".fatelf")
+        .unwrap()
+        .file_range()
+        .unwrap();
+    let mask_offset = usize::try_from(offset).unwrap() + 8;
+    for (name, mask, compression, encryption, supported) in [
+        ("core-with-lz4", 0, "lz4", "none", false),
+        ("core-with-encryption", 0, "none", "key", false),
+        ("lz4-only", 1, "lz4", "none", true),
+        ("encryption-only", 2, "none", "key", true),
+    ] {
+        let mut bytes = original.clone();
+        bytes[mask_offset] = mask;
+        fs::write(&launcher, bytes).unwrap();
+        let output = directory.path().join(name);
+        let settings = serde_json::json!({
+            "version": 2, "output": output, "launcher": launcher,
+            "storage": {"compression": compression},
+            "keys": [{"name": "key", "key_file": key, "env": "FATELF_TEST_KEY"}],
+            "payloads": [{"name": "sample", "path": payload, "encryption": encryption}],
+        });
+        fs::write(&config, toml::to_string_pretty(&settings).unwrap()).unwrap();
+        let attempted = tool(&["build".into(), "--config".into(), config.as_os_str().into()]);
+        if supported {
+            success(&attempted);
+        } else {
+            assert!(!attempted.status.success(), "{name}");
+            assert!(
+                String::from_utf8_lossy(&attempted.stderr)
+                    .contains("launcher does not support the selected codecs"),
+                "{name}"
+            );
+        }
+        assert_eq!(output.exists(), supported, "{name}");
     }
 }
 
