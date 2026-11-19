@@ -3,6 +3,8 @@
 #[cfg(feature = "builder")]
 use crate::error::Error;
 #[cfg(feature = "builder")]
+use crate::{codec::StoredCodec, container::Chunk};
+#[cfg(feature = "builder")]
 use object::{Object, ObjectSection};
 
 const COMPRESSION: u8 = 1;
@@ -100,6 +102,17 @@ pub(crate) struct LauncherCodecs {
 
 #[cfg(feature = "builder")]
 impl LauncherCodecs {
+    /// Collect the capabilities needed by a stored object pool.
+    pub(crate) fn required(chunks: &[Chunk]) -> Self {
+        Self {
+            compression: chunks
+                .iter()
+                .any(|chunk| chunk.codec == StoredCodec::Lz4Block),
+            encryption: chunks.iter().any(|chunk| chunk.encryption.is_some()),
+            zstandard: chunks.iter().any(|chunk| chunk.codec.uses_zstd()),
+        }
+    }
+
     /// Check the optional codecs actually used by the prepared bundle.
     pub(crate) fn validate(&self, required: Self) -> Result<(), Error> {
         if required.compression && !self.compression

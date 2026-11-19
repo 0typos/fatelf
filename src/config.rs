@@ -311,7 +311,7 @@ impl Document {
 }
 
 /// Read a bounded configuration snapshot without following a replacement symlink.
-fn read_config(path: &Path) -> Result<(Vec<u8>, File), Error> {
+pub(crate) fn read_config(path: &Path) -> Result<(Vec<u8>, File), Error> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
@@ -550,6 +550,7 @@ mod tests {
             document.config.encode().unwrap()
         );
 
+        flock(&open_directory, FlockOperation::Unlock).unwrap();
         drop(open_directory);
         save(&config, &path, Some(&document)).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), config.encode().unwrap());

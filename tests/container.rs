@@ -1028,6 +1028,20 @@ fn smoke_runs_the_requested_variant_with_its_arguments_and_status() {
     ]);
     assert_eq!(output.status.code(), Some(27));
     assert!(output.stderr.is_empty());
+    for expected in ["27", "0"] {
+        let output = tool(&[
+            "smoke".into(),
+            bundle.as_os_str().into(),
+            "--variant".into(),
+            "b".into(),
+            "--expect-exit".into(),
+            expected.into(),
+            "--".into(),
+            "exit".into(),
+            "27".into(),
+        ]);
+        assert_eq!(output.status.success(), expected == "27");
+    }
     let output = tool(&[
         "smoke".into(),
         bundle.as_os_str().into(),
@@ -1036,4 +1050,67 @@ fn smoke_runs_the_requested_variant_with_its_arguments_and_status() {
     ]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown payload"));
+}
+
+#[test]
+fn promotion_requires_all_smokes_and_rollback_restores_the_previous_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = tempdir().unwrap();
+    let live = directory.path().join("live");
+    let staged = directory.path().join("staged");
+    let checks = directory.path().join("smoke.toml");
+    success(&pack(&live, &["--default", "a"], false));
+    success(&pack(&staged, &["--default", "b"], false));
+    let inode = |path| fs::metadata(path).unwrap().ino();
+    let original = [inode(&live), inode(&staged)];
+    let promote = || {
+        tool(&[
+            "promote".into(),
+            staged.as_os_str().into(),
+            "--live".into(),
+            live.as_os_str().into(),
+            "--checks".into(),
+            checks.as_os_str().into(),
+        ])
+    };
+    for (checks_text, error) in [
+        ("a = ['exit', '0']\n", "cover every bundle variant"),
+        (
+            "a = ['exit', '0']\nb = ['exit', '17']\n",
+            "returned exit status: 17",
+        ),
+    ] {
+        fs::write(&checks, checks_text).unwrap();
+        let rejected = promote();
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains(error));
+        assert_eq!([inode(&live), inode(&staged)], original);
+    }
+    fs::write(&checks, "a = ['exit', '0']\nb = ['exit', '0']\n").unwrap();
+    success(&promote());
+    assert_eq!([inode(&live), inode(&staged)], [original[1], original[0]]);
+    assert_eq!(inspect(&live)["default"], "b");
+    success(&tool(&[
+        "rollback".into(),
+        staged.as_os_str().into(),
+        "--live".into(),
+        live.as_os_str().into(),
+    ]));
+    assert_eq!([inode(&live), inode(&staged)], original);
+    assert_eq!(inspect(&live)["default"], "a");
+    let mut damaged = fs::read(&staged).unwrap();
+    damaged[0] = 0;
+    fs::write(&staged, damaged).unwrap();
+    let rejected = tool(&[
+        "rollback".into(),
+        staged.as_os_str().into(),
+        "--live".into(),
+        live.as_os_str().into(),
+    ]);
+    assert!(
+        !rejected.status.success(),
+        "rollback admitted a damaged launcher"
+    );
+    assert_eq!([inode(&live), inode(&staged)], original);
 }

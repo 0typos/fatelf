@@ -541,11 +541,7 @@ impl PackOptions {
         }
         let (chunks, pool_length) = pool.layout(self.order, self.seed)?;
         let mask_required = chunks.iter().any(|c| c.encoding == Encoding::XorMask);
-        launcher_codecs.validate(LauncherCodecs {
-            compression: chunks.iter().any(|c| c.codec == StoredCodec::Lz4Block),
-            encryption: chunks.iter().any(|c| c.encryption.is_some()),
-            zstandard: chunks.iter().any(|c| c.codec.uses_zstd()),
-        })?;
+        launcher_codecs.validate(LauncherCodecs::required(&chunks))?;
         let used: HashSet<&str> = chunks
             .iter()
             .filter_map(|c| c.encryption.as_ref().map(|e| e.key.as_str()))

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0-beta.3
+
+- Cap complete bundle size with `max_output_bytes` and report plan headroom.
+- Diagnose host compatibility and verify payloads from a finished bundle.
+- Assert smoke exit statuses, promote a verified bundle after all variant
+  smoke checks pass, and roll back by atomically exchanging bundle paths.
+
 ## 0.2.0-beta.2
 
 - Add `zstd` for independent object compression and `zstd-delta` for sharing

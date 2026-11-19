@@ -3,19 +3,20 @@
 use std::{
     env, fs,
     io::{self, Write},
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::Path,
 };
 
 use rustix::{
-    fs::{Access, Mode, StatVfsMountFlags, access, fchmod, statvfs},
+    fs::{Access, Mode, StatVfsMountFlags, access, fchmod, fstatvfs, statvfs},
     io::Errno,
 };
 use serde::Serialize;
 
 use crate::{
+    capabilities::LauncherCodecs,
     config::Document,
-    container::{Backend, MAX_PAYLOAD},
+    container::{Backend, Container, MAX_PAYLOAD},
     elf::ElfMetadata,
     error::Error,
     launch::executable_memfd,
@@ -107,30 +108,147 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool, strict: bool) -> Resul
             let destination = output_parent(output).and_then(|parent| storage(parent, false));
             checks.push(check("output", output.display().to_string(), destination));
 
-            if matches!(options.backend, Backend::Memfd) {
-                let subject = "memfd".into();
-                checks.push(if probe {
-                    check(
-                        "memfd_probe",
-                        subject,
-                        executable_memfd().and_then(|file| {
-                            fchmod(&file, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
-                            Ok("empty executable descriptor created".into())
-                        }),
-                    )
-                } else {
-                    Check {
-                        code: "memfd_probe",
-                        status: Status::Skipped,
-                        subject,
-                        detail: "use --probe to try allocating an empty executable descriptor"
-                            .into(),
-                    }
-                });
-            }
+            append_memfd_probe(&mut checks, options.backend, probe);
         }
         Err(error) => checks.push(check("config", config.display().to_string(), Err(error))),
     }
+    report(&checks, json, strict)
+}
+
+/// Check the actual launcher and verified payload bytes without executing them.
+pub(crate) fn bundle(path: &Path, json: bool, probe: bool, strict: bool) -> Result<(), Error> {
+    let mut checks = Vec::new();
+    let subject = path.display().to_string();
+    match Container::open_path(path) {
+        Ok(mut container) => {
+            let original = container.source_file().metadata()?;
+            let launcher = container
+                .source_file()
+                .try_clone()
+                .map_err(Error::from)
+                .and_then(|file| ElfMetadata::read_file(file, path, true));
+            let required = LauncherCodecs::required(&container.manifest.chunks);
+            checks.push(check(
+                "launcher",
+                subject.clone(),
+                launcher
+                    .as_ref()
+                    .map_err(ToString::to_string)
+                    .and_then(|elf| {
+                        elf.codecs
+                            .as_ref()
+                            .expect("invariant: launcher read includes codecs")
+                            .validate(required)
+                            .map_err(|error| error.to_string())?;
+                        if fstatvfs(container.source_file())
+                            .map_err(|error| error.to_string())?
+                            .f_flag
+                            .contains(StatVfsMountFlags::NOEXEC)
+                        {
+                            return Err("bundle is on a noexec mount".into());
+                        }
+                        access(path, Access::EXEC_OK).map_err(|error| error.to_string())?;
+                        Ok(format!("{:?} executable launcher", elf.architecture))
+                    }),
+            ));
+            if let Ok(elf) = &launcher {
+                checks.push(check(
+                    "launcher_interpreter",
+                    subject.clone(),
+                    interpreter(elf),
+                ));
+                checks.push(loader_paths("launcher_loader_paths", subject.clone(), elf));
+            }
+            let backend = container.manifest.backend;
+            let tmp = env::temp_dir();
+            checks.push(check(
+                "temporary_storage",
+                tmp.display().to_string(),
+                storage(&tmp, matches!(backend, Backend::File)),
+            ));
+            append_memfd_probe(&mut checks, backend, probe);
+            for index in 0..container.manifest.payloads.len() {
+                let name = container.manifest.payloads[index].name.clone();
+                let metadata = tempfile::NamedTempFile::new_in(&tmp)
+                    .map_err(Error::from)
+                    .and_then(|scratch| {
+                        let (mut file, scratch_path) = scratch.into_parts();
+                        scratch_path.close()?;
+                        container.reconstruct(index, &mut file)?;
+                        ElfMetadata::read_file(file, Path::new(&name), false)
+                    });
+                let architecture = metadata
+                    .as_ref()
+                    .map_err(ToString::to_string)
+                    .and_then(|elf| {
+                        if let Ok(launcher) = &launcher
+                            && !elf.matches(launcher)
+                        {
+                            return Err("payload architecture differs from launcher".into());
+                        }
+                        Ok(format!(
+                            "{:?} ELF; payload bytes verified",
+                            elf.architecture
+                        ))
+                    });
+                checks.push(check("payload_elf", name.clone(), architecture));
+                if let Ok(elf) = &metadata {
+                    checks.push(check("interpreter", name.clone(), interpreter(elf)));
+                    checks.push(loader_paths("payload_loader_paths", name, elf));
+                }
+            }
+            let matching_path = fs::metadata(path).is_ok_and(|current| {
+                (
+                    current.dev(),
+                    current.ino(),
+                    current.ctime(),
+                    current.ctime_nsec(),
+                ) == (
+                    original.dev(),
+                    original.ino(),
+                    original.ctime(),
+                    original.ctime_nsec(),
+                )
+            });
+            if !matching_path {
+                checks.push(check(
+                    "bundle",
+                    subject,
+                    Err::<String, _>("bundle changed during diagnostics"),
+                ));
+            }
+        }
+        Err(error) => checks.push(check("bundle", subject, Err(error))),
+    }
+    report(&checks, json, strict)
+}
+
+/// Share the allocation probe across both diagnostic entry points.
+fn append_memfd_probe(checks: &mut Vec<Check>, backend: Backend, probe: bool) {
+    if matches!(backend, Backend::Memfd) {
+        let subject = "memfd".into();
+        checks.push(if probe {
+            check(
+                "memfd_probe",
+                subject,
+                executable_memfd().and_then(|file| {
+                    fchmod(&file, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+                    Ok("empty executable descriptor created".into())
+                }),
+            )
+        } else {
+            Check {
+                code: "memfd_probe",
+                status: Status::Skipped,
+                subject,
+                detail: "use --probe to try allocating an empty executable descriptor".into(),
+            }
+        });
+    }
+}
+
+/// Print the report and preserve the diagnostic exit status.
+fn report(checks: &[Check], json: bool, strict: bool) -> Result<(), Error> {
     let ok = checks.iter().all(|entry| {
         !matches!(entry.status, Status::Error)
             && !(strict && matches!(entry.status, Status::Warning))
@@ -143,7 +261,7 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool, strict: bool) -> Resul
         )?;
         writeln!(stdout)?;
     } else {
-        for entry in &checks {
+        for entry in checks {
             let status = match entry.status {
                 Status::Ok => "ok",
                 Status::Error => "error",
@@ -195,7 +313,7 @@ fn loader_paths(code: &'static str, subject: String, elf: &ElfMetadata) -> Check
 }
 
 /// Check the path named by PT_INTERP without running a dependency lister.
-fn interpreter(elf: &ElfMetadata) -> Result<String, Error> {
+pub(crate) fn interpreter(elf: &ElfMetadata) -> Result<String, Error> {
     let Some(bytes) = elf.interpreter.as_deref() else {
         return Ok("no PT_INTERP segment".into());
     };

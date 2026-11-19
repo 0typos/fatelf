@@ -376,6 +376,11 @@ pub(crate) struct Container<R> {
 
 #[cfg(feature = "builder")]
 impl Container<File> {
+    /// Borrow the opened inode for host and ELF diagnostics.
+    pub(crate) fn source_file(&self) -> &File {
+        &self.source
+    }
+
     /// Open a regular container file without waiting for writers on a FIFO.
     pub(crate) fn open_path(path: &Path) -> Result<Self, Error> {
         let file = OpenOptions::new()
@@ -393,6 +398,19 @@ impl Container<File> {
 }
 
 impl<R: Read + Seek> Container<R> {
+    /// Validate every reconstructed payload without running it or writing output.
+    #[cfg(feature = "builder")]
+    pub(crate) fn verify(&mut self) -> Result<(), Error> {
+        let mut sink = std::io::sink();
+        for index in 0..self.manifest.payloads.len() {
+            self.reconstruct(index, &mut sink).map_err(|error| {
+                let name = &self.manifest.payloads[index].name;
+                error.context(format!("verifying payload {name:?}"))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Read the locator and bounded JSON, then derive the selected physical layout.
     pub(crate) fn open(mut source: R) -> Result<Self, Error> {
         let length = source.seek(SeekFrom::End(0))?;

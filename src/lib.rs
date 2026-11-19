@@ -11,6 +11,8 @@ mod codec;
 mod config;
 mod container;
 #[cfg(feature = "builder")]
+mod deploy;
+#[cfg(feature = "builder")]
 mod doctor;
 mod elf;
 mod error;

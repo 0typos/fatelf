@@ -151,7 +151,16 @@ pub(crate) struct ElfMetadata {
 impl ElfMetadata {
     /// Load program headers and optional launcher capabilities through bounded cached reads.
     pub(crate) fn read(path: &Path, max_bytes: u64, launcher: bool) -> Result<Self, Error> {
-        let cache = ReadCache::new(open_bounded(path, max_bytes.min(MAX_PAYLOAD))?);
+        Self::read_file(
+            open_bounded(path, max_bytes.min(MAX_PAYLOAD))?,
+            path,
+            launcher,
+        )
+    }
+
+    /// Inspect an already opened executable, including an anonymous reconstructed payload.
+    pub(crate) fn read_file(file: File, path: &Path, launcher: bool) -> Result<Self, Error> {
+        let cache = ReadCache::new(file);
         let remaining = Cell::new(16 * 1024 * 1024);
         let data = MetadataReader(&cache, &remaining);
         let header = data

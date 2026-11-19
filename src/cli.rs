@@ -4,8 +4,7 @@ use std::{
     ffi::OsString,
     io::{self, Write},
     os::unix::process::CommandExt,
-    path::{PathBuf, absolute},
-    process::Command as ProcessCommand,
+    path::PathBuf,
 };
 
 use clap::{Parser, Subcommand};
@@ -15,7 +14,7 @@ use crate::{
     codec::{StoredCodec, random_xor_mask},
     config::Document,
     container::Container,
-    doctor,
+    deploy, doctor,
     error::Error,
     pack::{PackOptions, extract},
     tui,
@@ -47,10 +46,12 @@ enum Command {
         #[arg(short, long)]
         config: PathBuf,
     },
-    /// Diagnose build inputs and host conditions without launching payloads.
+    /// Diagnose build inputs or a finished bundle without launching payloads.
     Doctor {
-        #[arg(short, long)]
-        config: PathBuf,
+        #[arg(short, long, required_unless_present = "bundle")]
+        config: Option<PathBuf>,
+        #[arg(long, conflicts_with = "config")]
+        bundle: Option<PathBuf>,
         /// Emit a versioned JSON report.
         #[arg(long)]
         json: bool,
@@ -81,8 +82,26 @@ enum Command {
         input: PathBuf,
         #[arg(long)]
         variant: String,
+        /// Succeed only if the bundle process exits with this status.
+        #[arg(long)]
+        expect_exit: Option<u8>,
         #[arg(last = true)]
         args: Vec<OsString>,
+    },
+    /// Verify and smoke-test a staged bundle, then exchange it with the live file.
+    Promote {
+        staged: PathBuf,
+        #[arg(long)]
+        live: PathBuf,
+        /// TOML table mapping every variant to its smoke-test arguments.
+        #[arg(long)]
+        checks: PathBuf,
+    },
+    /// Exchange the live bundle with a verified previous bundle.
+    Rollback {
+        previous: PathBuf,
+        #[arg(long)]
+        live: PathBuf,
     },
     /// Recover an original executable byte-for-byte to a new output path.
     Extract {
@@ -119,10 +138,19 @@ pub(crate) fn run() -> Result<(), Error> {
         }
         Command::Doctor {
             config,
+            bundle,
             json,
             probe,
             strict,
-        } => doctor::run(&config, json, probe, strict),
+        } => match bundle {
+            Some(bundle) => doctor::bundle(&bundle, json, probe, strict),
+            None => doctor::run(
+                &config.expect("invariant: doctor requires config or bundle"),
+                json,
+                probe,
+                strict,
+            ),
+        },
         Command::Configure { config, output } => tui::run(config.as_deref(), output.as_deref()),
         Command::Extract {
             input,
@@ -132,31 +160,32 @@ pub(crate) fn run() -> Result<(), Error> {
         Command::Smoke {
             input,
             variant,
+            expect_exit,
             args,
         } => {
-            let path = absolute(&input)?;
-            let container = Container::open_path(&path)?;
+            let container = Container::open_path(&input)?;
             container.payload_index(&variant)?;
-            let selector = container.manifest.select_env.clone();
-            drop(container);
-            Err(ProcessCommand::new(path)
-                .arg0(input)
-                .args(args)
-                .env(selector, variant)
-                .exec()
-                .into())
-        }
-        Command::Verify { input } => {
-            let mut container = Container::open_path(&input)?;
-            let mut output = io::sink();
-            for index in 0..container.manifest.payloads.len() {
-                container.reconstruct(index, &mut output).map_err(|error| {
-                    let name = &container.manifest.payloads[index].name;
-                    error.context(format!("verifying payload {name:?}"))
-                })?;
+            let mut command = deploy::bundle_command(&container, &input, &variant);
+            command.args(args);
+            if let Some(expected) = expect_exit {
+                let status = command.status()?;
+                if status.code() == Some(i32::from(expected)) {
+                    return Ok(());
+                }
+                Err(Error::Invalid(format!(
+                    "smoke expected exit {expected}, got {status}"
+                )))
+            } else {
+                Err(command.exec().into())
             }
-            Ok(())
         }
+        Command::Promote {
+            staged,
+            live,
+            checks,
+        } => deploy::exchange(&live, &staged, Some(&checks)),
+        Command::Rollback { previous, live } => deploy::exchange(&live, &previous, None),
+        Command::Verify { input } => Container::open_path(&input)?.verify(),
         Command::Inspect { input } => {
             let container = Container::open_path(&input)?;
             let manifest = &container.manifest;

@@ -3,6 +3,7 @@
 | Command | When to use it |
 |---|---|
 | `fatelf doctor --config bundle.toml --strict --probe` | Check launcher revision, location-dependent ELF loader paths, interpreter paths, and host storage. The optional memfd probe allocates an empty descriptor. |
+| `fatelf doctor --bundle ./combined --strict --probe` | Check the installed launcher and reconstruct each payload to verify its bytes and inspect its ELF metadata. |
 | `fatelf plan --config bundle.toml` | Check build policies and get exact output sizes before publishing. It reads used build keys and uses the same temporary spool as a build. |
 | `fatelf inspect ./combined` | List payloads, selection policy, and storage statistics from an existing bundle. |
 | `fatelf verify ./combined` | Reconstruct every payload without execution and validate its digest. Supply all required runtime key files. |
@@ -88,6 +89,48 @@ status for that application, such as `--version` where supported. Smoke
 executes the actual bundle with its configured selector. Metadata inspection
 cannot validate transitive dependencies, runtime-loaded libraries, or adjacent
 application resources.
+
+On a host that has only the installed bundle, use `doctor --bundle ./combined`
+instead of `--config`. This checks the actual launcher's executable permissions
+and mount, then reconstructs each payload into anonymous temporary storage to
+verify its digest and inspect its interpreter and loader paths. It needs space
+for the largest payload in `TMPDIR` and the runtime key files for encrypted
+variants. It never launches a payload.
+
+Use `smoke --expect-exit 0` to turn an explicit smoke invocation into a pass/fail
+check. For nonzero expectations, remember a launcher failure can use the same
+status as a payload. Use a probe with a successful exit and meaningful output
+when validating deployments.
+
+## Promote and roll back
+
+Keep the live executable and a separately built candidate in the same trusted
+directory on a filesystem that supports Linux atomic rename exchange. Give
+each variant one harmless smoke invocation in a TOML file:
+
+```toml
+bash = ["-c", "exit 0"]
+ps = ["-p", "1", "-o", "pid,comm"]
+```
+
+```sh
+fatelf doctor --bundle ./app.next --strict --probe
+fatelf promote ./app.next --live ./app --checks smoke.toml
+# Restore the former live bundle if needed.
+fatelf rollback ./app.next --live ./app
+```
+
+Promotion verifies all candidate payloads and requires every smoke command to
+exit zero. The checks run as the current user in the current environment with
+the supplied arguments. Run only trusted bundles and choose commands that
+terminate promptly. On success, `app` names the candidate and `app.next`
+names the previous bundle. Keep its runtime keys available. Rollback verifies
+that previous bundle before swapping the paths back.
+
+Run updates from a directory writable only by trusted operators. An advisory
+lock serializes Fatelf exchanges. Each exchange is atomic and retains both
+files. If the final directory sync fails, inspect both paths before retrying
+because the exchange may already be visible.
 
 ## Verify a bundle
 

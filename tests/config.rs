@@ -619,6 +619,32 @@ fn doctor_reports_missing_interpreter_without_building() {
             .any(|check| { check["code"] == "memfd_probe" && check["status"] == "skipped" })
     );
     assert!(!path.join("combined").exists());
+    let bundle = path.join("combined");
+    success(&tool(
+        &[
+            "build".into(),
+            "--config".into(),
+            config_path.as_os_str().into(),
+        ],
+        path,
+    ));
+    fs::remove_file(&payload).unwrap();
+    fs::remove_file(&config_path).unwrap();
+    let result = tool(
+        &[
+            "doctor".into(),
+            "--bundle".into(),
+            bundle.as_os_str().into(),
+            "--json".into(),
+            "--probe".into(),
+        ],
+        path,
+    );
+    assert_eq!(result.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(report["checks"].as_array().unwrap().iter().any(|check| {
+        check["code"] == "interpreter" && check["subject"] == "a" && check["status"] == "error"
+    }));
 }
 
 #[test]
