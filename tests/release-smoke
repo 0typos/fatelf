@@ -59,12 +59,12 @@ key_file = "smoke.key"
 env = "FATELF_SMOKE_KEY"
 
 [[payloads]]
-name = "yes"
-path = "/usr/bin/true"
+name = "process"
+path = "/usr/bin/ps"
 
 [[payloads]]
-name = "no"
-path = "/usr/bin/false"
+name = "shell"
+path = "/usr/bin/bash"
 encryption = "smoke"
 
 [storage]
@@ -75,15 +75,16 @@ backend = "$backend"
 TOML
     "$bin_dir/fatelf" build --config smoke.toml
     FATELF_SMOKE_KEY="$PWD/smoke.key" "$bin_dir/fatelf" verify "$bundle"
-    "./$bundle"
+    "./$bundle" -p 1 -o pid= > "$bundle.stdout"
+    grep -Eq '^[[:space:]]*1[[:space:]]*$' "$bundle.stdout"
 
     status=0
-    FATELF_SMOKE_KEY="$PWD/smoke.key" FATELF_VARIANT=no "./$bundle" 2>"$bundle.stderr" || status=$?
-    test "$status" -eq 1
+    FATELF_SMOKE_KEY="$PWD/smoke.key" FATELF_VARIANT=shell "./$bundle" -c 'exit 17' 2>"$bundle.stderr" || status=$?
+    test "$status" -eq 17
     test ! -s "$bundle.stderr"
 
-    FATELF_SMOKE_KEY="$PWD/smoke.key" "$bin_dir/fatelf" extract "$bundle" --variant no -o "$bundle.extracted"
-    cmp "$bundle.extracted" /usr/bin/false
+    FATELF_SMOKE_KEY="$PWD/smoke.key" "$bin_dir/fatelf" extract "$bundle" --variant shell -o "$bundle.extracted"
+    cmp "$bundle.extracted" /usr/bin/bash
     cp "$bundle" "$bundle.truncated"
     truncate -s -1 "$bundle.truncated"
     status=0
@@ -99,7 +100,7 @@ output = "unbuilt"
 
 [[payloads]]
 name = "no"
-path = "/usr/bin/false"
+path = "/usr/bin/bash"
 TOML
 "$bin_dir/fatelf" doctor --config doctor.toml --probe --json > doctor.json
 test ! -e unbuilt

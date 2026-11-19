@@ -39,6 +39,9 @@
   deliberately inherited ignored SIGPIPE is consequently not retained.
   Rust startup also reopens closed standard descriptors (0, 1, and 2) on
   `/dev/null`; deliberately closed standard descriptors are not retained.
+- Some multicall executables select or validate the utility using their
+  executable name or path. Ubuntu's uutils `ls` is one example. Use a
+  standalone executable if the multicall payload rejects the bundle.
 - `/proc/self/exe` refers to the reconstructed, anonymous/unlinked executable.
   Programs using their executable pathname, `$ORIGIN`-relative libraries, or
   resources beside the original executable may require adaptation. Neither

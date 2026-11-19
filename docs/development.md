@@ -54,7 +54,8 @@ The default `builder` feature enables the packer and both codecs;
 `--no-default-features` exposes the runtime entrypoint and runtime error variants.
 `compact-hash` is additive; explicitly enabling it with `builder` changes hashing
 there too because Cargo unifies dependency features. Normal builder defaults stay native.
-This MVP feature/API split is not a stable library surface.
+The beta supports the documented CLI and file formats. The Rust library
+entry points and Cargo feature split are internal implementation details.
 
 Tests use independent native stdout, original bytes, exit/PID/signal behavior,
 malformed objects, key failures, policy tampering, and resource limits as oracles.
@@ -66,6 +67,7 @@ The first source release targets x86-64 Linux with a compatible host userspace.
 Run `just release-check` from a fresh checkout on an x86-64 Linux runner
 before cutting a release. It runs the standard gate and both fuzz smokes,
 builds the static tools, and verifies packing, launching, and extraction on
-both backends. The smoke needs binutils (`readelf`), GNU grep, and GNU coreutils. Validate other architectures on their target hosts
+both backends. The smoke needs Bash, `ps`, binutils (`readelf`), GNU grep, and
+GNU coreutils. Validate other architectures on their target hosts
 before claiming support. Follow the [release procedure](release/README.md)
 for signing and verifying binary packages.

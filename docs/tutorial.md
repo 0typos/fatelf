@@ -15,6 +15,9 @@ with an external key while leaving the `ls` body plain.
 Run from this repository on a compatible Linux host with `/usr/bin/ls`,
 `/usr/bin/ps`, their libraries, and `/proc` available. The release recipe requires
 this repository's configured Rust, musl, Zig and cargo build tooling.
+The examples use standalone GNU `ls`. On hosts with a multicall implementation
+of `ls`, follow the [quickstart](../README.md#pack-run-and-verify) with Bash
+and `ps`.
 
 ```bash
 set -euo pipefail

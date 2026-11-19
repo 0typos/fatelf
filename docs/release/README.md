@@ -25,6 +25,8 @@ mount-policy evidence. If a build is killed while staging its output, its final
 destination remains absent, but a partial temporary file can remain beside it.
 Inspect that directory before retrying after an interrupted build.
 
+## Compatibility and rollback
+
 Keep v2 readers compatible with v2 bundles emitted by earlier supported
 releases. Test the checked-in v2 fixture and representative encrypted and
 compressed bundles as part of format changes. Breaking wire changes need a
@@ -34,6 +36,14 @@ versioned in the TOML file.
 Ship the packer and launcher together. New builds require the packer's
 current launcher compatibility revision. Update that revision when the packer
 can generate bundles that the previous launcher revision cannot run.
+
+Before promoting a deployment, run `doctor --probe` and `smoke` as the
+deployment user in the target environment. Smoke-test each deployed variant
+with a harmless invocation that checks the application's expected behavior.
+Build and verify the next bundle at a separate path. Keep the prior bundle,
+source configuration and access to its runtime keys until the new bundle has
+passed the deployment checks. To roll back, restore the prior bundle and
+runtime configuration together and rerun its smoke checks.
 
 ## Prepare binary artifacts
 

@@ -1,11 +1,11 @@
 # Fatelf on x86-64 Linux
 
 Keep `fatelf` and `fatelf-launcher` together. Run this example from the
-unpacked directory on a host with `/usr/bin/ls` and `/usr/bin/ps`.
+unpacked directory on a host with `/usr/bin/bash` and `/usr/bin/ps`.
 
 ```sh
-./fatelf pack ls=/usr/bin/ls ps=/usr/bin/ps -o ./combined
-FATELF_VARIANT=ls ./combined -1
+./fatelf pack bash=/usr/bin/bash ps=/usr/bin/ps -o ./combined
+FATELF_VARIANT=bash ./combined -c 'printf "%s\n" "hello from Fatelf"'
 FATELF_VARIANT=ps ./combined -p 1 -o pid,comm
 ./fatelf verify ./combined
 ```
