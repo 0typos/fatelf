@@ -135,3 +135,44 @@ fn execute(executable: File, private_environment: &[String]) -> Result<(), Error
 fn cstring(value: &OsStr) -> Result<CString, Error> {
     CString::new(value.as_bytes()).map_err(|_| Error::Invalid("argument contains NUL".into()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Write,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
+
+    use rustix::{
+        fs::fcntl_get_seals,
+        io::{FdFlags, fcntl_getfd},
+    };
+
+    use super::{Container, SealFlags, file_executable, memory_executable};
+    use crate::container::tests::sample_image;
+
+    #[test]
+    fn reconstructed_descriptors_have_expected_permissions_and_seals() {
+        let mut image = tempfile::tempfile().unwrap();
+        image.write_all(&sample_image()).unwrap();
+        let mut container = Container::open(image).unwrap();
+
+        let anonymous = memory_executable(&mut container, 0).unwrap();
+        assert_eq!(
+            anonymous.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fcntl_getfd(&anonymous).unwrap(), FdFlags::CLOEXEC);
+        assert_eq!(
+            fcntl_get_seals(&anonymous).unwrap(),
+            SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL,
+        );
+
+        let scratch = file_executable(&mut container, 0).unwrap();
+        assert_eq!(
+            scratch.metadata().unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert_eq!(scratch.metadata().unwrap().nlink(), 0);
+    }
+}

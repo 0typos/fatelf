@@ -571,7 +571,7 @@ pub(crate) fn validate_name(name: &str) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         Backend, Budgets, Chunk, Container, FOOTER_LEN, Footer, MAGIC, Manifest, Payload, Position,
         RuntimeKey,
@@ -662,6 +662,10 @@ mod tests {
         bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
         bytes.extend_from_slice(blake3::hash(&metadata).as_bytes());
         bytes
+    }
+
+    pub(crate) fn sample_image() -> Vec<u8> {
+        image(&manifest(Position::End))
     }
 
     #[test]
