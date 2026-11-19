@@ -831,11 +831,145 @@ fn tail(value: &str, width: usize) -> &str {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/pty.rs"]
+mod test_pty;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn terminal_session_restores_after_input_or_output_failure() {
+        use std::{
+            fs::File,
+            io::Write,
+            os::fd::{AsRawFd, FromRawFd, OwnedFd},
+            process::Stdio,
+            thread,
+            time::Instant,
+        };
+
+        const CHILD_MODE: &str = "FATELF_TEST_TERMINAL_FAILURE";
+        if let Some(fault) = env::var_os(CHILD_MODE) {
+            if fault == "signal" {
+                let handler = || {
+                    let mut action = MaybeUninit::<libc::sigaction>::zeroed();
+                    // SAFETY: a null action queries the disposition into writable storage.
+                    unsafe {
+                        assert_eq!(
+                            libc::sigaction(libc::SIGTERM, std::ptr::null(), action.as_mut_ptr()),
+                            0
+                        );
+                        action.assume_init().sa_sigaction
+                    }
+                };
+                let prior = handler();
+                let guard = Termination::install().unwrap();
+                assert_eq!(handler(), handle_sigterm as *const () as usize);
+                drop(guard);
+                assert_eq!(handler(), prior);
+                return;
+            }
+            assert!(fault == "input" || fault == "output");
+            let output_fault = fault == "output";
+            let mut session = Session::new().unwrap();
+            let mut builder = Builder::new(settings()).unwrap();
+            io::stdout().flush().unwrap();
+            let fd = if output_fault {
+                libc::STDOUT_FILENO
+            } else {
+                libc::STDIN_FILENO
+            };
+            let path = if output_fault {
+                "/dev/full"
+            } else {
+                "/dev/null"
+            };
+            let faulty = File::options().read(true).write(true).open(path).unwrap();
+            // SAFETY: this isolated child owns its stdio, holds the duplicate open,
+            // and restores the descriptor before dropping the session.
+            let saved = unsafe {
+                let duplicate = libc::dup(fd);
+                assert!(duplicate >= 0);
+                let saved = OwnedFd::from_raw_fd(duplicate);
+                assert_eq!(libc::dup2(faulty.as_raw_fd(), fd), fd);
+                saved
+            };
+            let result = if output_fault {
+                session.finish()
+            } else {
+                edit(
+                    &mut session.terminal,
+                    &mut builder,
+                    Path::new("unused"),
+                    None,
+                )
+                .map(|_| ())
+            };
+            // SAFETY: saved is an open copy of this child's original stdio descriptor.
+            assert_eq!(unsafe { libc::dup2(saved.as_raw_fd(), fd) }, fd);
+            drop(session);
+            let error = result.unwrap_err();
+            if output_fault {
+                assert!(
+                    matches!(error, Error::Io(error) if error.raw_os_error() == Some(libc::ENOSPC))
+                );
+            }
+            return;
+        }
+
+        for fault in ["input", "output", "signal"] {
+            let mut pty = super::test_pty::Pty::open();
+            let original = pty.settings();
+            assert!(!pty.is_raw());
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "tui::tests::terminal_session_restores_after_input_or_output_failure",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, fault)
+                .stderr(Stdio::piped());
+            // Without a controlling tty, crossterm can't reopen /dev/tty on input failure.
+            pty.attach(&mut command, false);
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut transcript = Vec::new();
+            while child.try_wait().unwrap().is_none() {
+                pty.drain(&mut transcript);
+                if Instant::now() > deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("terminal session did not propagate {fault} failure");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            pty.drain(&mut transcript);
+            assert!(
+                output.status.success(),
+                "{fault}: {} {}",
+                String::from_utf8_lossy(&transcript),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            pty.assert_restored(&original);
+            if fault != "signal" {
+                let position = |sequence: &[u8]| {
+                    transcript
+                        .windows(sequence.len())
+                        .position(|bytes| bytes == sequence)
+                };
+                assert!(position(b"\x1b[?1049h").unwrap() < position(b"\x1b[?1049l").unwrap());
+                if fault == "input" {
+                    assert!(position(b"\x1b[?25l").unwrap() < position(b"\x1b[?25h").unwrap());
+                }
+            }
+        }
+    }
 
     /// A valid portable document keeps keyboard tests independent of real executable files.
     fn settings() -> BuildConfig {
@@ -965,19 +1099,182 @@ mod tests {
         terminal
             .draw(|frame| builder.draw(frame, Path::new("/config.toml")))
             .unwrap();
-        let screen: String = terminal
+        let rows: Vec<String> = terminal
             .backend()
             .buffer()
             .content
-            .iter()
-            .map(|c| c.symbol())
+            .chunks(50)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect();
+        let row = rows
+            .iter()
+            .find(|row| row.contains("Output binary"))
+            .unwrap();
         assert!(
-            screen.contains("尾 巴 ▌"),
-            "editing cursor and trailing text must remain visible: {screen}"
+            row.contains("尾 巴 ▌"),
+            "editing cursor and trailing text must remain in the selected row: {row}"
         );
-        assert!(screen.contains("Tradeoffs / help"));
+        assert!(rows.iter().any(|row| row.contains("Tradeoffs / help")));
+        assert!(rows.iter().any(|row| row.contains("Prefer a full path")));
         assert_eq!(key(&mut builder, KeyCode::Esc), Decision::Continue);
         assert_eq!(key(&mut builder, KeyCode::Esc), Decision::Cancel);
+    }
+
+    #[test]
+    fn editing_respects_utf8_limit_and_keeps_the_previous_value_on_cancel() {
+        let mut builder = Builder::new(settings()).unwrap();
+        let original = builder.config.output.clone();
+        key(&mut builder, KeyCode::Enter);
+        builder.editing = Some("x".repeat(4094));
+        key(&mut builder, KeyCode::Char('é'));
+        assert_eq!(builder.editing.as_ref().unwrap().len(), 4096);
+        let error = builder
+            .handle(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "field exceeds 4096 bytes");
+        key(&mut builder, KeyCode::Backspace);
+        assert_eq!(builder.editing.as_ref().unwrap().len(), 4094);
+        for event in [
+            KeyEvent::new(KeyCode::Char('\0'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(builder.handle(event).unwrap(), Decision::Continue);
+        }
+        assert_eq!(builder.editing.as_ref().unwrap().len(), 4094);
+        key(&mut builder, KeyCode::Esc);
+        assert_eq!(builder.config.output, original);
+    }
+
+    #[test]
+    fn focus_and_choices_wrap_in_both_directions() {
+        let mut builder = Builder::new(settings()).unwrap();
+        for (back, forward) in [
+            (KeyCode::BackTab, KeyCode::Tab),
+            (KeyCode::Up, KeyCode::Down),
+        ] {
+            key(&mut builder, back);
+            assert!(matches!(
+                builder.field(builder.selected),
+                Field::PayloadEncryption(1)
+            ));
+            key(&mut builder, forward);
+            assert!(matches!(builder.field(builder.selected), Field::Output));
+        }
+        builder.selected = FIXED
+            .iter()
+            .position(|field| matches!(field, Field::Backend))
+            .unwrap();
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+        ] {
+            let before = builder.value(Field::Backend);
+            key(&mut builder, code);
+            assert_ne!(builder.value(Field::Backend), before);
+        }
+        assert_eq!(builder.value(Field::Backend), "memfd");
+        builder.selected = FIXED
+            .iter()
+            .position(|field| matches!(field, Field::Scope))
+            .unwrap();
+        for (direction, expected) in [
+            (KeyCode::Left, "ranges"),
+            (KeyCode::Left, "sections"),
+            (KeyCode::Right, "ranges"),
+            (KeyCode::Right, "all"),
+        ] {
+            key(&mut builder, direction);
+            assert_eq!(builder.value(Field::Scope), expected);
+        }
+    }
+
+    #[test]
+    fn form_exposes_supported_choices_and_clears_optional_settings() {
+        assert_eq!(Field::Order.choices(), ["ordered", "shuffled"]);
+        assert_eq!(Field::ManifestPosition.choices(), ["front", "end"]);
+        assert_eq!(Field::Compression.choices(), ["none", "lz4"]);
+        assert_eq!(
+            Field::PayloadShuffle(0).choices(),
+            ["inherit", "false", "true"]
+        );
+
+        let mut builder = Builder::new(settings()).unwrap();
+        for (field, value) in [
+            (Field::Launcher, "launcher"),
+            (Field::Default, "b"),
+            (Field::PayloadEncryption(0), "external-key"),
+        ] {
+            builder.set(field, value).unwrap();
+            assert_eq!(builder.value(field), value);
+            builder.set(field, "").unwrap();
+            assert!(builder.value(field).is_empty());
+        }
+
+        let field = builder.field(FIXED.len() + 2);
+        assert!(matches!(field, Field::PayloadShuffle(0)));
+        for state in ["true", "false", "inherit"] {
+            builder.set(field, state).unwrap();
+            assert_eq!(builder.value(field), state);
+        }
+        assert_eq!(builder.config.payloads[0].shuffle, None);
+    }
+
+    #[test]
+    fn new_payloads_use_free_names_and_deleting_the_last_fixes_focus() {
+        let mut config = settings();
+        config.payloads[0].name = "payload3".into();
+        config.payloads[1].name = "payload4".into();
+        let mut builder = Builder::new(config).unwrap();
+        key(&mut builder, KeyCode::F(2));
+        assert_eq!(builder.config.payloads[2].name, "payload5");
+        builder.selected = builder.count() - 1;
+        key(&mut builder, KeyCode::F(3));
+        assert!(matches!(
+            builder.field(builder.selected),
+            Field::PayloadEncryption(1)
+        ));
+    }
+
+    #[test]
+    fn save_preserves_explicit_scope_and_rebases_only_when_the_directory_changes() {
+        let root = tempdir().unwrap();
+        let other = root.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let original = root.path().join("opened.toml");
+        config::save(&settings(), &original, None).unwrap();
+        let document = Document::load(&original).unwrap();
+        let mut builder = Builder::new(document.config.clone()).unwrap();
+        builder.set(Field::Order, "shuffled").unwrap();
+        builder.set(Field::Scope, "sections").unwrap();
+        builder.set(Field::Values, r#"[".text"]"#).unwrap();
+        let same = root.path().join("same.toml");
+        builder.save(&same, Some(&document)).unwrap();
+        let saved = Document::load(&same).unwrap().config;
+        assert_eq!(saved.storage.sections, [".text"]);
+        assert_eq!(saved.payloads[0].path, Path::new("one"));
+
+        builder.set(Field::Scope, "all").unwrap();
+        let elsewhere = other.join("moved.toml");
+        let error = builder.save(&elsewhere, Some(&document)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "scope values must be [] when scope is all"
+        );
+        assert!(!elsewhere.exists());
+        builder.set(Field::Values, "[]").unwrap();
+        builder.save(&elsewhere, Some(&document)).unwrap();
+        let saved = Document::load(&elsewhere).unwrap().config;
+        assert!(saved.storage.sections.is_empty());
+        assert_eq!(saved.payloads[0].path, root.path().join("one"));
+    }
+
+    #[test]
+    fn tail_keeps_only_the_suffix_that_fits_by_display_width() {
+        assert_eq!(tail("ab路", 3), "b路");
+        assert_eq!(tail("ab路", 2), "路");
+        assert_eq!(tail("ab路", 1), "");
+        assert_eq!(tail("ascii", 0), "");
     }
 }

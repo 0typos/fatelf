@@ -690,3 +690,125 @@ fn doctor_and_build_reject_a_shared_library_without_an_entry_point() {
     }
     assert!(!path.join("combined").exists());
 }
+
+#[path = "support/pty.rs"]
+mod test_pty;
+
+#[test]
+fn editor_restores_terminal_after_cancel_save_build_and_sigterm() {
+    use std::{
+        io::Write,
+        os::unix::process::ExitStatusExt,
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let position = |transcript: &[u8], sequence: &[u8]| {
+        transcript
+            .windows(sequence.len())
+            .position(|bytes| bytes == sequence)
+    };
+    let enter = b"\x1b[?1049h";
+    let leave = b"\x1b[?1049l";
+    let hide = b"\x1b[?25l";
+    let show = b"\x1b[?25h";
+    for (input, saves, builds, missing_tty) in [
+        (Some(&b"\x03"[..]), false, false, None),
+        (Some(&b"\x1b[15~"[..]), true, false, None),
+        (Some(&b"\x1b[17~"[..]), true, true, None),
+        (None, false, false, None),
+        (None, false, false, Some("stdin")),
+        (None, false, false, Some("stdout")),
+    ] {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source.toml");
+        let destination = directory.path().join("saved.toml");
+        fs::write(
+            &source,
+            toml::to_string_pretty(&settings("combined")).unwrap(),
+        )
+        .unwrap();
+        let mut pty = test_pty::Pty::open();
+        let original = pty.settings();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fatelf"));
+        command
+            .args(["configure", "--config"])
+            .arg(&source)
+            .arg("--output")
+            .arg(&destination)
+            .stderr(Stdio::piped());
+        pty.attach(&mut command, missing_tty != Some("stdin"));
+        match missing_tty {
+            Some("stdin") => {
+                command.stdin(Stdio::null());
+            }
+            Some("stdout") => {
+                command.stdout(Stdio::null());
+            }
+            _ => {}
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut transcript = Vec::new();
+        let mut sent = false;
+        while child.try_wait().unwrap().is_none() {
+            pty.drain(&mut transcript);
+            if missing_tty.is_none()
+                && !sent
+                && pty.is_raw()
+                && position(&transcript, enter).is_some()
+                && position(&transcript, hide).is_some()
+            {
+                if let Some(input) = input {
+                    pty.master.write_all(input).unwrap();
+                } else {
+                    kill_process(Pid::from_raw(child.id() as i32).unwrap(), Signal::TERM).unwrap();
+                }
+                sent = true;
+            }
+            if Instant::now() > deadline {
+                child.kill().unwrap();
+                let result = child.wait_with_output().unwrap();
+                panic!(
+                    "editor timed out for {input:?}: {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let result = child.wait_with_output().unwrap();
+        pty.drain(&mut transcript);
+        pty.assert_restored(&original);
+        if missing_tty.is_some() {
+            assert_eq!(result.status.code(), Some(1));
+            assert!(
+                String::from_utf8_lossy(&result.stderr)
+                    .contains("requires an interactive terminal")
+            );
+            assert!(!destination.exists());
+            continue;
+        }
+        assert!(sent, "{input:?}: editor must finish terminal setup");
+        for (setup, restore) in [(enter.as_slice(), leave.as_slice()), (hide, show)] {
+            let setup_index = position(&transcript, setup).unwrap();
+            assert!(
+                position(&transcript[setup_index + setup.len()..], restore).is_some(),
+                "{input:?}: missing terminal restoration sequence {restore:?}"
+            );
+        }
+        if input.is_some() {
+            success(&result);
+        } else {
+            assert_eq!(result.status.signal(), Some(libc::SIGTERM));
+        }
+        assert_eq!(destination.exists(), saves, "{input:?}");
+        assert_eq!(
+            directory.path().join("combined").exists(),
+            builds,
+            "{input:?}"
+        );
+    }
+}
