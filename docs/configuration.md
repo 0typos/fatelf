@@ -176,6 +176,12 @@ shuffle seeds never control encryption nonces.
 
 ## Resource limits
 
+Set the optional top-level `max_output_bytes` to a positive integer to cap
+the complete executable, including the launcher, stored objects, manifest,
+and footer. Direct packing accepts `--max-output-bytes`. An oversized bundle
+fails planning and building without publishing an output. Plans that fit
+report `max_output_bytes` and `output_headroom_bytes`.
+
 `[budgets]` accepts integer byte counts/counts with conservative defaults below
 hard ceilings. Zero and excessive values fail; configured limits cannot remove
 hard bounds.

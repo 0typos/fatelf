@@ -145,6 +145,9 @@ pub(crate) struct PackOptions {
     /// New output path; existing paths are never overwritten.
     #[arg(short, long)]
     pub(crate) output: PathBuf,
+    /// Maximum complete bundle size in bytes.
+    #[arg(long)]
+    pub(crate) max_output_bytes: Option<u64>,
     /// Launcher ELF (defaults to fatelf-launcher beside this tool).
     #[arg(long)]
     pub(crate) launcher: Option<PathBuf>,
@@ -236,6 +239,9 @@ impl PackOptions {
     /// Validate shared CLI/config semantics without reading or writing input files.
     pub(crate) fn validate(&self) -> Result<(), Error> {
         self.budgets.validate()?;
+        if self.max_output_bytes == Some(0) {
+            return Err(Error::Invalid("max_output_bytes must be positive".into()));
+        }
         for (field, value) in [
             ("launcher_name", self.launcher_name.as_deref()),
             ("launcher_version", self.launcher_version.as_deref()),
@@ -398,7 +404,7 @@ impl PackOptions {
     pub(crate) fn plan(&self) -> Result<serde_json::Value, Error> {
         let prepared = self.prepare()?;
         let logical: u64 = prepared.manifest.payloads.iter().map(|p| p.length).sum();
-        Ok(serde_json::json!({
+        let mut report = serde_json::json!({
             "version": 2, "manifest_position": self.manifest_position,
             "launcher_bytes": prepared.launcher.len(), "logical_bytes": logical,
             "stored_bytes": prepared.pool_length, "manifest_bytes": prepared.manifest_bytes.len(),
@@ -409,7 +415,12 @@ impl PackOptions {
                 "object_references":p.chunks.len(),
                 "encrypted_objects":p.chunks.iter().filter(|&&id| prepared.manifest.chunks[id].encryption.is_some()).count()
             })).collect::<Vec<_>>()
-        }))
+        });
+        if let Some(limit) = self.max_output_bytes {
+            report["max_output_bytes"] = serde_json::json!(limit);
+            report["output_headroom_bytes"] = serde_json::json!(limit - prepared.output_length);
+        }
+        Ok(report)
     }
 
     /// Write a planned container atomically, authenticating encrypted objects to its manifest.
@@ -579,6 +590,13 @@ impl PackOptions {
             .and_then(|v| v.checked_add(manifest_bytes.len() as u64))
             .and_then(|v| v.checked_add(FOOTER_LEN))
             .ok_or_else(|| Error::Invalid("output length overflow".into()))?;
+        if let Some(limit) = self.max_output_bytes
+            && output_length > limit
+        {
+            return Err(Error::Invalid(format!(
+                "bundle requires {output_length} bytes, exceeding max_output_bytes ({limit})"
+            )));
+        }
         let footer = Footer {
             magic: *MAGIC,
             launcher_length,

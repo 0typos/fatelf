@@ -42,6 +42,8 @@ pub(crate) struct BuildConfig {
     pub(crate) version: u32,
     pub(crate) output: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_output_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) launcher: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) launcher_name: Option<String>,
@@ -144,6 +146,7 @@ impl BuildConfig {
         Self {
             version: 2,
             output: "combined".into(),
+            max_output_bytes: None,
             launcher: None,
             launcher_name: None,
             launcher_version: None,
@@ -209,6 +212,7 @@ impl BuildConfig {
                 })
                 .collect(),
             output: resolve(base, &self.output),
+            max_output_bytes: self.max_output_bytes,
             launcher: self.launcher.as_ref().map(|path| resolve(base, path)),
             launcher_name: self.launcher_name.clone(),
             launcher_version: self.launcher_version.clone(),

@@ -327,6 +327,28 @@ fn single_payload_front_manifest_plan_predicts_exact_output_size() {
         !directory.path().join("combined").exists(),
         "planning must not publish an output"
     );
+    let output_bytes = plan["output_bytes"].as_u64().unwrap();
+    config["max_output_bytes"] = json!(output_bytes - 1);
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    for command in ["plan", "build"] {
+        let rejected = tool(
+            &[command.into(), "--config".into(), path.as_os_str().into()],
+            directory.path(),
+        );
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("exceeding max_output_bytes"));
+        assert!(!directory.path().join("combined").exists());
+    }
+    config["max_output_bytes"] = json!(output_bytes);
+    fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    let planned = tool(
+        &["plan".into(), "--config".into(), path.as_os_str().into()],
+        directory.path(),
+    );
+    success(&planned);
+    let plan: Value = serde_json::from_slice(&planned.stdout).unwrap();
+    assert_eq!(plan["max_output_bytes"], output_bytes);
+    assert_eq!(plan["output_headroom_bytes"], 0);
     success(&tool(
         &["build".into(), "--config".into(), path.as_os_str().into()],
         directory.path(),
