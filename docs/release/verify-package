@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Authenticate the selected release archive before it can be extracted.
+set -euo pipefail
+
+if [[ $# != 2 ]]; then
+    echo "Usage: bash docs/release/verify-package TRUSTED_KEYRING ARCHIVE" >&2
+    exit 2
+fi
+keyring=$(realpath -e -- "$1")
+archive=$2
+parent=$(dirname -- "$archive")
+name=$(basename -- "$archive")
+cd -- "$parent"
+
+gpgv --keyring "$keyring" SHA256SUMS.sig SHA256SUMS
+actual=$(sha256sum -- "$name")
+if [[ "$actual" != "$(<SHA256SUMS)" ]]; then
+    echo "Archive $name does not match the signed release record" >&2
+    exit 1
+fi
+printf 'Verified %s\n' "$archive"

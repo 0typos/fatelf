@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Wrap rustc without changing Cargo's rustflags precedence.
+set -euo pipefail
+
+FATELF_RELEASE_ROOT=$(pwd -P)
+FATELF_RELEASE_CARGO=$(realpath -ms -- "${CARGO_HOME:-$HOME/.cargo}")
+FATELF_RELEASE_CARGO_REAL=$(realpath -m -- "$FATELF_RELEASE_CARGO")
+FATELF_RELEASE_SYSROOT=$("${RUSTC:-rustc}" --print sysroot)
+export FATELF_RELEASE_ROOT FATELF_RELEASE_CARGO FATELF_RELEASE_CARGO_REAL FATELF_RELEASE_SYSROOT
+export FATELF_CHAIN_RUSTC_WRAPPER="${RUSTC_WRAPPER-${CARGO_BUILD_RUSTC_WRAPPER-}}"
+export RUSTC_WRAPPER="$FATELF_RELEASE_ROOT/docs/release/remap-rustc"
+exec cargo auditable zigbuild --target-dir target/fatelf-distribution "$@"

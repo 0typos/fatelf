@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Exercise the actual static release pair in an isolated directory.
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cargo_dir=$(realpath -ms -- "${CARGO_HOME:-$HOME/.cargo}")
+cargo_dir_real=$(realpath -m -- "$cargo_dir")
+sysroot=$("${RUSTC:-rustc}" --print sysroot)
+bin_dir=$(cd -- "${1:?expected the release binary directory}" && pwd -P)
+smoke_dir=$(mktemp -d)
+trap 'rm -rf -- "$smoke_dir"' EXIT
+cd -- "$smoke_dir"
+
+for name in fatelf fatelf-launcher; do
+    readelf --program-headers "$bin_dir/$name" > "$name.headers"
+    if [[ $(<"$name.headers") == *INTERP* ]]; then
+        echo "$name depends on a host ELF interpreter" >&2
+        exit 1
+    fi
+    for prefix in "$repo_dir" "$cargo_dir" "$cargo_dir_real" "$sysroot"; do
+        if LC_ALL=C grep -aFq -- "$prefix/" "$bin_dir/$name"; then
+            echo "$name embeds a private source path" >&2
+            exit 1
+        else
+            test "$?" -eq 1
+        fi
+    done
+done
+
+"$bin_dir/fatelf" verify "$repo_dir/fuzz/seeds/container/v2"
+unset FATELF_VARIANT FATELF_SMOKE_KEY
+umask 077
+head -c 32 /dev/urandom > smoke.key
+for backend in memfd file; do
+    bundle="bundle-$backend"
+    cat > smoke.toml <<TOML
+version = 2
+output = "$bundle"
+
+[[keys]]
+name = "smoke"
+key_file = "smoke.key"
+env = "FATELF_SMOKE_KEY"
+
+[[payloads]]
+name = "yes"
+path = "/usr/bin/true"
+
+[[payloads]]
+name = "no"
+path = "/usr/bin/false"
+encryption = "smoke"
+
+[storage]
+compression = "lz4"
+
+[execution]
+backend = "$backend"
+TOML
+    "$bin_dir/fatelf" build --config smoke.toml
+    FATELF_SMOKE_KEY="$PWD/smoke.key" "$bin_dir/fatelf" verify "$bundle"
+    "./$bundle"
+
+    status=0
+    FATELF_SMOKE_KEY="$PWD/smoke.key" FATELF_VARIANT=no "./$bundle" 2>"$bundle.stderr" || status=$?
+    test "$status" -eq 1
+    test ! -s "$bundle.stderr"
+
+    FATELF_SMOKE_KEY="$PWD/smoke.key" "$bin_dir/fatelf" extract "$bundle" --variant no -o "$bundle.extracted"
+    cmp "$bundle.extracted" /usr/bin/false
+    cp "$bundle" "$bundle.truncated"
+    truncate -s -1 "$bundle.truncated"
+    status=0
+    "$bin_dir/fatelf" verify "$bundle.truncated" >"$bundle.verify" 2>&1 || status=$?
+    if [[ "$status" != 1 ]]; then
+        echo "verification exited $status for a truncated bundle (expected 1)" >&2
+        exit 1
+    fi
+done
+cat > doctor.toml <<'TOML'
+version = 2
+output = "unbuilt"
+
+[[payloads]]
+name = "no"
+path = "/usr/bin/false"
+TOML
+"$bin_dir/fatelf" doctor --config doctor.toml --probe --json > doctor.json
+test ! -e unbuilt
+echo "Static release smoke passed for memfd and file."

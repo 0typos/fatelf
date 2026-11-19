@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Test the publication format with a disposable signer and a consumer keyring.
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+bin_dir=$(cd -- "${1:?expected the release binary directory}" && pwd -P)
+scratch=$(mktemp -d)
+export GNUPGHOME="$scratch/gnupg"
+trap 'gpgconf --kill gpg-agent || true; rm -rf -- "$scratch"' EXIT
+mkdir -m 0700 "$GNUPGHOME"
+gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key \
+    'Fatelf release smoke (disposable)' ed25519 sign 1d
+fingerprint=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1=="fpr" && !seen++ {print $10}')
+gpg --batch --export "$fingerprint" > "$scratch/trusted.gpg"
+
+cd "$scratch"
+mkdir -p docs/release tests fuzz/seeds/container target/x86_64-unknown-linux-musl/release unpacked
+cp "$repo/docs/release/package" "$repo/docs/release/verify-package" docs/release/
+cp "$repo/tests/release-smoke" tests/
+cp "$repo/fuzz/seeds/container/v2" fuzz/seeds/container/
+cp "$repo/LICENSE" "$repo/README.md" .
+cp "$bin_dir/fatelf" "$bin_dir/fatelf-launcher" target/x86_64-unknown-linux-musl/release/
+printf '%s\n' 'Disposable notice fixture for the packaging test.' > fixture.notice
+release=$(bash docs/release/package fixture.notice "$fingerprint")
+archive="$release/${release##*/}.tar.gz"
+
+bash docs/release/verify-package "$scratch/trusted.gpg" "$archive"
+tar -xzf "$archive" -C unpacked
+cmp "$bin_dir/fatelf" "unpacked/${release##*/}/fatelf"
+cmp "$bin_dir/fatelf-launcher" "unpacked/${release##*/}/fatelf-launcher"
+cmp fixture.notice "unpacked/${release##*/}/NOTICE"
+
+cp "$archive" "$release/other.tar.gz"
+if bash docs/release/verify-package "$scratch/trusted.gpg" "$release/other.tar.gz"; then
+    echo "Verifier accepted a different filename beside a valid signed record" >&2
+    exit 1
+fi
+printf '\0' >> "$archive"
+if bash docs/release/verify-package "$scratch/trusted.gpg" "$archive"; then
+    echo "Verifier accepted a modified release archive" >&2
+    exit 1
+fi
+echo "Signed release package accepted; wrong-name and modified archives rejected."

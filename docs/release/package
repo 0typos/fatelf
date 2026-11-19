@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Assemble a signed release locally using an explicitly provided GPG key.
+set -euo pipefail
+
+if [[ $# != 2 || ! $2 =~ ^([[:xdigit:]]{40}|[[:xdigit:]]{64})$ ]]; then
+    echo "Usage: bash docs/release/package NOTICE_FILE SIGNING_FINGERPRINT" >&2
+    exit 2
+fi
+notice=$1
+fingerprint=$2
+if [[ ! -f "$notice" || ! -s "$notice" ]]; then
+    echo "A reviewed, nonempty dependency notice file is required" >&2
+    exit 2
+fi
+
+bin_dir=target/x86_64-unknown-linux-musl/release
+dist=target/dist
+mkdir -p -- "$dist"
+scratch=$(mktemp -d "$dist/.package.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+mkdir -- "$scratch/tools" "$scratch/release"
+install -m 0755 "$bin_dir/fatelf" "$bin_dir/fatelf-launcher" "$scratch/tools"
+bash tests/release-smoke "$scratch/tools" >&2
+version=$("$scratch/tools/fatelf" --version)
+if [[ ! $version =~ ^fatelf\ ([0-9]+\.[0-9]+\.[0-9]+([-+][a-zA-Z0-9.+-]+)?)$ ]]; then
+    echo "Unable to determine a release version" >&2
+    exit 1
+fi
+name="fatelf-${BASH_REMATCH[1]}-x86_64-unknown-linux-musl"
+archive="$name.tar.gz"
+mv -- "$scratch/tools" "$scratch/$name"
+install -m 0644 LICENSE README.md "$scratch/$name"
+install -m 0644 "$notice" "$scratch/$name/NOTICE"
+tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+    -C "$scratch" -cf - "$name" | gzip -n > "$scratch/release/$archive"
+(
+    cd -- "$scratch/release"
+    sha256sum "$archive" > SHA256SUMS
+    gpg --batch --no-tty --local-user "$fingerprint" \
+        --detach-sign --output SHA256SUMS.sig SHA256SUMS
+)
+mv -T --no-clobber -- "$scratch/release" "$dist/$name"
+if [[ -d "$scratch/release" ]]; then
+    echo "$dist/$name already exists" >&2
+    exit 1
+fi
+printf '%s\n' "$dist/$name"

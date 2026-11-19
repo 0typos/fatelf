@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Run real ls/ps builds in a fresh directory; record locally with asciinema/agg.
+set -euo pipefail
+
+DEMO_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+DEMO_ROOT=$(cd "$DEMO_HERE/../../.." && pwd)
+export LC_ALL=C.UTF-8
+DEMO_BIN="$DEMO_ROOT/target/x86_64-unknown-linux-musl/release"
+export PATH="$DEMO_BIN:$PATH"
+COLS=${COLS:-110}
+ROWS=${ROWS:-34}
+
+say() {
+  printf '\n\033[38;2;0;207;232m# %s\033[0m\n' "$1"
+  sleep 1
+}
+
+run() {
+  printf '\033[38;2;255;176;0m$\033[0m '
+  local index
+  for ((index = 0; index < ${#1}; index++)); do
+    printf '%s' "${1:index:1}"
+    sleep 0.012
+  done
+  printf '\n'
+  eval "$1"
+  sleep 1.4
+}
+
+render() {
+  agg --quiet --cols "$COLS" --rows "$ROWS" --font-size 14 \
+    --idle-time-limit 3 "$DEMO_HERE/$1.cast" "$DEMO_HERE/$1.gif"
+}
+
+if [[ ${1:-} == --play ]]; then
+  backend=${2:?expected memfd or file}
+  case $backend in memfd|file) ;; *) exit 2 ;; esac
+  if [[ -n ${FATELF_RECORD_STATUS:-} ]]; then
+    trap 'printf "%s\n" "$?" > "$FATELF_RECORD_STATUS"' EXIT
+  fi
+  test -x "$DEMO_BIN/fatelf"
+  test -x "$DEMO_BIN/fatelf-launcher"
+  mkdir -p "$DEMO_ROOT/target"
+  demo_dir=$(mktemp -d "$DEMO_ROOT/target/ls-ps-$backend.XXXXXX")
+  cd "$demo_dir"
+  mkdir samples
+  touch samples/alpha.txt samples/beta.txt samples/gamma.txt
+  unset FATELF_APP PS_KEY_FILE
+  say "Two real dynamically linked ELF programs, one executable entrypoint."
+  run 'file /usr/bin/ls /usr/bin/ps'
+  if [[ $backend == memfd ]]; then
+    say "Only ps is shuffled; both embedded ELF headers are masked."
+    run 'fatelf pack ls=/usr/bin/ls ps=/usr/bin/ps -o ./combined \
+  --select-env FATELF_APP --default ls --exec memfd \
+  --order shuffled --shuffle-payload ps --seed 42 --dedup \
+  --manifest-position end'
+  else
+    python3 - <<'PY'
+import os, pathlib
+key = pathlib.Path("ps.key")
+with os.fdopen(os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as output:
+    output.write(os.urandom(32))
+pathlib.Path("bundle.toml").write_text('''version = 2
+output = "combined"
+
+[[keys]]
+name = "ps"
+key_file = "ps.key"
+env = "PS_KEY_FILE"
+
+[[payloads]]
+name = "ls"
+path = "/usr/bin/ls"
+shuffle = false
+compression = "none"
+
+[[payloads]]
+name = "ps"
+path = "/usr/bin/ps"
+shuffle = true
+compression = "lz4"
+encryption = "ps"
+
+[selection]
+env = "FATELF_APP"
+default = "ls"
+
+[storage]
+layout = "overlay"
+manifest_position = "front"
+order = "shuffled"
+dedup = true
+seed = 42
+
+[execution]
+backend = "file"
+''')
+PY
+    say "Front manifest, plain ls body, and compressed/encrypted ps from TOML."
+    run 'cat bundle.toml'
+    run 'fatelf plan --config ./bundle.toml'
+    run 'fatelf build --config ./bundle.toml'
+  fi
+  run 'stat -c "%n %s bytes" /usr/bin/ls /usr/bin/ps ./combined'
+  run 'fatelf inspect ./combined'
+  say "No selector: combined runs ls. Arguments go to the selected program."
+  run './combined -1 samples'
+  say "Explicit ls selection uses exactly the same executable."
+  run 'FATELF_APP=ls ./combined -1 samples'
+  say "Select ps from that entrypoint; show only PID 1, not the host process list."
+  if [[ $backend == file ]]; then
+    say "ls needed no key. The encrypted ps variant must reject a missing key."
+    run 'if FATELF_APP=ps ./combined -p 1 -o pid,comm; then
+  printf "ERROR: encrypted ps launched without a key\n" >&2; exit 1
+else
+  printf "Expected: encrypted ps denied without PS_KEY_FILE\n"
+fi'
+    run "export PS_KEY_FILE=\"\$PWD/ps.key\""
+  fi
+  run 'FATELF_APP=ps ./combined -p 1 -o pid,comm'
+  say "Compare stdout with the native programs and recover both original ELFs."
+  run 'FATELF_APP=ls ./combined -1 samples > bundled-ls.stdout
+/usr/bin/ls -1 samples > native-ls.stdout
+cmp bundled-ls.stdout native-ls.stdout'
+  run 'FATELF_APP=ps ./combined -p 1 -o pid,comm > bundled-ps.stdout
+/usr/bin/ps -p 1 -o pid,comm > native-ps.stdout
+cmp bundled-ps.stdout native-ps.stdout'
+  run 'fatelf extract ./combined --variant ls -o ./recovered-ls'
+  run 'fatelf extract ./combined --variant ps -o ./recovered-ps'
+  run 'cmp /usr/bin/ls ./recovered-ls && cmp /usr/bin/ps ./recovered-ps'
+  run 'fatelf verify ./combined'
+  say "Verified: native stdout matches; both extracted ELFs are byte-exact."
+  printf '\nBuild directory: %s\n' "${demo_dir#"$DEMO_ROOT"/}"
+  exit 0
+fi
+
+case ${1:-} in
+  '') gif=1 ;;
+  --no-gif) gif=0 ;;
+  --render) render 01-ls-ps-memfd; render 02-ls-ps-toml-file; exit 0 ;;
+  *) printf 'Usage: %s [--no-gif|--render|--play memfd|--play file]\n' "$0" >&2; exit 2 ;;
+esac
+
+command -v asciinema >/dev/null
+if ((gif)); then command -v agg >/dev/null; fi
+mkdir -p "$DEMO_ROOT/target"
+status_dir=$(mktemp -d "$DEMO_ROOT/target/record-status.XXXXXX")
+for backend in memfd file; do
+  if [[ $backend == memfd ]]; then name=01-ls-ps-memfd; else name=02-ls-ps-toml-file; fi
+  export FATELF_RECORD_STATUS="$status_dir/$backend"
+  printf -v record_command 'bash %q --play %q' "$DEMO_HERE/record" "$backend"
+  asciinema rec --overwrite --quiet --cols "$COLS" --rows "$ROWS" \
+    --idle-time-limit 3 --title "fatelf: ls + ps ($backend)" --env '' \
+    --command "$record_command" "$DEMO_HERE/$name.cast"
+  test "$(cat "$FATELF_RECORD_STATUS")" = 0
+  if ((gif)); then render "$name"; fi
+done

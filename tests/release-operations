@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Test resource failures in scratch storage on a Linux runner with user namespaces.
+set -euo pipefail
+bin_dir=$(cd -- "${1:?expected the release binary directory}" && pwd -P)
+scratch=$(mktemp -d)
+trap 'rm -rf -- "$scratch"' EXIT
+cd -- "$scratch"
+mkdir mount
+unset FATELF_VARIANT
+
+for backend in memfd file; do
+    "$bin_dir/fatelf" pack run=/usr/bin/true -o "$backend" --exec "$backend"
+    children=()
+    for _ in {1..8}; do
+        "./$backend" &
+        children+=("$!")
+    done
+    for pid in "${children[@]}"; do
+        wait "$pid"
+    done
+done
+
+# Allow the small payload spool, but stop the process when the staged bundle
+# grows beyond the limit. The final destination must remain absent.
+payload_size=$(stat -c %s /usr/bin/true)
+file_blocks=$(( (payload_size + 1023) / 1024 ))
+status=0
+bash -euo pipefail -c '
+    set +o posix
+    ulimit -c 0
+    ulimit -f "$2"
+    exec "$1" pack run=/usr/bin/true -o interrupted
+' bash "$bin_dir/fatelf" "$file_blocks" 2>interrupted.stderr || status=$?
+test "$status" -eq 153
+test ! -e interrupted
+
+cp /usr/bin/true large
+head -c 2097152 /dev/urandom >> large
+cat > operational.toml <<'TOML'
+version = 2
+output = "unpublished"
+
+[[payloads]]
+name = "run"
+path = "large"
+
+[execution]
+backend = "file"
+TOML
+
+unshare --user --map-root-user --mount --propagation private bash -euo pipefail -c '
+    mount -t tmpfs -o noexec,size=1M tmpfs mount
+    export TMPDIR="$PWD/mount"
+    status=0
+    ./file 2> noexec.stderr || status=$?
+    test "$status" -eq 1
+    LC_ALL=C grep -q "Permission denied" noexec.stderr
+    status=0
+    "$1" doctor --config operational.toml --json > noexec.json 2>&1 || status=$?
+    test "$status" -eq 1
+    grep -q "file backend cannot execute on a noexec mount" noexec.json
+
+    status=0
+    LC_ALL=C "$1" build --config operational.toml > full.stderr 2>&1 || status=$?
+    test "$status" -eq 1
+    grep -q "No space left on device" full.stderr
+    test ! -e unpublished
+' bash "$bin_dir/fatelf"
+echo "Concurrent launch, interrupted output, noexec, and spool exhaustion checks passed."

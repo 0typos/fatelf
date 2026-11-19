@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Cargo supplies the compiler command as the first argument.
+set -euo pipefail
+
+if [[ -n ${FATELF_CHAIN_RUSTC_WRAPPER:-} ]]; then
+    set -- "$FATELF_CHAIN_RUSTC_WRAPPER" "$@"
+fi
+exec "$@" \
+    "--remap-path-prefix=$FATELF_RELEASE_ROOT=/usr/src/fatelf" \
+    "--remap-path-prefix=$FATELF_RELEASE_CARGO=/usr/src/cargo" \
+    "--remap-path-prefix=$FATELF_RELEASE_CARGO_REAL=/usr/src/cargo" \
+    "--remap-path-prefix=$FATELF_RELEASE_SYSROOT=/usr/src/rust"
