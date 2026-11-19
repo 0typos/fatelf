@@ -439,7 +439,7 @@ fn invalid_launcher_descriptor_is_rejected_without_creating_output() {
         .file_range()
         .unwrap();
     let offset = usize::try_from(offset).unwrap();
-    fs::copy("/usr/bin/true", &payload).unwrap();
+    fs::copy(&fixtures().a, &payload).unwrap();
     for (description, index, byte) in [
         ("wrong version", 7, b'1'),
         ("unknown codec", 8, 0x80),
@@ -475,15 +475,14 @@ fn duplicate_launcher_descriptor_is_rejected() {
     let mut bytes = fs::read(env!("CARGO_BIN_EXE_fatelf-launcher")).unwrap();
     let elf = object::File::parse(bytes.as_slice()).unwrap();
     let capabilities = elf.section_by_name(".fatelf").unwrap();
-    let duplicate = elf.section_by_name(".symtab").unwrap();
-    assert!(duplicate.index().0 > capabilities.index().0);
     let names = elf.section_by_name(".shstrtab").unwrap();
+    assert!(names.index().0 > capabilities.index().0);
     let (offset, _) = names.file_range().unwrap();
     let name_offset = names
         .data()
         .unwrap()
-        .windows(8)
-        .position(|name| name == b".symtab\0")
+        .windows(10)
+        .position(|name| name == b".shstrtab\0")
         .unwrap();
     let name_offset = usize::try_from(offset).unwrap() + name_offset;
     bytes[name_offset..name_offset + 8].copy_from_slice(b".fatelf\0");
@@ -491,7 +490,7 @@ fn duplicate_launcher_descriptor_is_rejected() {
 
     let attempted = tool(&[
         "pack".into(),
-        "sample=/usr/bin/true".into(),
+        format!("sample={}", fixtures().a.display()).into(),
         "--launcher".into(),
         launcher.into_os_string(),
         "-o".into(),
@@ -513,7 +512,7 @@ fn build_respects_each_declared_launcher_codec() {
     let config = directory.path().join("bundle.toml");
     let key = directory.path().join("key");
     fs::write(&key, [13; 32]).unwrap();
-    fs::copy("/usr/bin/true", &payload).unwrap();
+    fs::copy(&fixtures().a, &payload).unwrap();
     let input = fs::OpenOptions::new().write(true).open(&payload).unwrap();
     input
         .set_len(input.metadata().unwrap().len() + 65536)
