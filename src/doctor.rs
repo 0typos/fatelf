@@ -36,11 +36,12 @@ struct Check {
 enum Status {
     Ok,
     Error,
+    Warning,
     Skipped,
 }
 
 /// Validate config and inspect the host without building a bundle or running a payload.
-pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
+pub(crate) fn run(config: &Path, json: bool, probe: bool, strict: bool) -> Result<(), Error> {
     let mut checks = Vec::new();
     match Document::load(config).and_then(|document| document.config.options(document.base())) {
         Ok(options) => {
@@ -55,12 +56,8 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
                         .as_ref()
                         .expect("invariant: launcher read includes codecs");
                     format!(
-                        "{:?}; v2; compression={}; encryption={}; xor={}; xor_mask={}",
-                        elf.architecture,
-                        codecs.compression,
-                        codecs.encryption,
-                        codecs.xor,
-                        codecs.xor_mask
+                        "{:?}; current launcher revision; compression={}; encryption={}",
+                        elf.architecture, codecs.compression, codecs.encryption
                     )
                 }),
             ));
@@ -69,6 +66,11 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
                     "launcher_interpreter",
                     launcher_path.display().to_string(),
                     interpreter(elf),
+                ));
+                checks.push(loader_paths(
+                    "launcher_loader_paths",
+                    launcher_path.display().to_string(),
+                    elf,
                 ));
             }
             for input in &options.inputs {
@@ -87,6 +89,11 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
                 checks.push(check("payload_elf", input.name.clone(), architecture));
                 if let Ok(elf) = &elf {
                     checks.push(check("interpreter", input.name.clone(), interpreter(elf)));
+                    checks.push(loader_paths(
+                        "payload_loader_paths",
+                        input.name.clone(),
+                        elf,
+                    ));
                 }
             }
 
@@ -124,14 +131,15 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
         }
         Err(error) => checks.push(check("config", config.display().to_string(), Err(error))),
     }
-    let ok = checks
-        .iter()
-        .all(|entry| !matches!(entry.status, Status::Error));
+    let ok = checks.iter().all(|entry| {
+        !matches!(entry.status, Status::Error)
+            && !(strict && matches!(entry.status, Status::Warning))
+    });
     let mut stdout = io::stdout().lock();
     if json {
         serde_json::to_writer_pretty(
             &mut stdout,
-            &serde_json::json!({ "schema_version": 1, "ok": ok, "checks": checks }),
+            &serde_json::json!({ "schema_version": 2, "ok": ok, "checks": checks }),
         )?;
         writeln!(stdout)?;
     } else {
@@ -139,6 +147,7 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
             let status = match entry.status {
                 Status::Ok => "ok",
                 Status::Error => "error",
+                Status::Warning => "warning",
                 Status::Skipped => "skipped",
             };
             writeln!(
@@ -159,6 +168,23 @@ fn check(code: &'static str, subject: String, result: Result<String, impl ToStri
     let (status, detail) = match result {
         Ok(detail) => (Status::Ok, detail),
         Err(error) => (Status::Error, error.to_string()),
+    };
+    Check {
+        code,
+        status,
+        subject,
+        detail,
+    }
+}
+
+/// Report path-dependent startup without running the loader or payload.
+fn loader_paths(code: &'static str, subject: String, elf: &ElfMetadata) -> Check {
+    let (status, detail) = match &elf.loader_path_warning {
+        Some(warning) => (Status::Warning, warning.clone()),
+        None => (
+            Status::Ok,
+            "no location-dependent paths found in ELF loader tags".into(),
+        ),
     };
     Check {
         code,
@@ -227,6 +253,7 @@ mod tests {
             architecture: object::Architecture::X86_64,
             little_endian: true,
             interpreter: None,
+            loader_path_warning: None,
             codecs: None,
         };
         assert_eq!(interpreter(&elf).unwrap(), "no PT_INTERP segment");

@@ -441,7 +441,7 @@ fn invalid_launcher_descriptor_is_rejected_without_creating_output() {
     let offset = usize::try_from(offset).unwrap();
     fs::copy(&fixtures().a, &payload).unwrap();
     for (description, index, byte) in [
-        ("wrong version", 7, b'1'),
+        ("invalid magic", 0, b'X'),
         ("unknown codec", 8, 0x80),
         ("nonzero reserved byte", 9, 1),
     ] {
@@ -867,38 +867,90 @@ fn payload_xor_masks_stored_bytes_and_round_trips_without_a_key() {
 }
 
 #[test]
-fn launcher_without_payload_xor_marker_can_only_pack_without_xor() {
+fn plain_pack_rejects_a_previous_launcher_revision() {
     let directory = tempdir().unwrap();
     let launcher = directory.path().join("launcher");
     let bundle = directory.path().join("bundle");
     let mut bytes = fs::read(env!("CARGO_BIN_EXE_fatelf-launcher")).unwrap();
     let elf = object::File::parse(bytes.as_slice()).unwrap();
-    let names = elf.section_by_name(".shstrtab").unwrap();
-    let name = b".fatelf.xor\0";
-    let index = names
-        .data()
+    let (offset, _) = elf
+        .section_by_name(".fatelf")
         .unwrap()
-        .windows(name.len())
-        .position(|window| window == name)
+        .file_range()
         .unwrap();
-    let (offset, _) = names.file_range().unwrap();
-    bytes[offset as usize + index + 8] = b'a';
+    bytes[offset as usize + 7] = b'2';
     fs::write(&launcher, bytes).unwrap();
-    let mut args = vec![
+    let output = tool(&[
         "pack".into(),
         format!("a={}", fixtures().a.display()).into(),
         "--launcher".into(),
-        launcher.into_os_string(),
+        launcher.as_os_str().into(),
         "-o".into(),
         bundle.as_os_str().into(),
-    ];
-    args.push("--xor".into());
-    let output = tool(&args);
+    ]);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("launcher does not support payload XOR")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("launcher compatibility revision"));
     assert!(!bundle.exists());
-    args.pop();
-    success(&tool(&args));
+
+    let config = directory.path().join("bundle.toml");
+    let settings = serde_json::json!({
+        "version": 2, "output": bundle, "launcher": launcher,
+        "payloads": [{"name": "a", "path": fixtures().a}]
+    });
+    fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
+    for command in ["doctor", "plan"] {
+        let output = tool(&[command.into(), "--config".into(), config.as_os_str().into()]);
+        assert!(!output.status.success(), "{command}");
+        assert!(
+            [&output.stdout, &output.stderr]
+                .iter()
+                .any(|stream| String::from_utf8_lossy(stream).contains("FATCAP03")),
+            "{command} should name the required revision"
+        );
+        assert!(!bundle.exists());
+    }
+}
+
+#[test]
+fn smoke_runs_the_requested_variant_with_its_arguments_and_status() {
+    let directory = tempdir().unwrap();
+    let bundle = directory.path().join("bundle");
+    success(&pack(
+        &bundle,
+        &["--select-env", "FATELF_TEST_CHOICE", "--default", "a"],
+        false,
+    ));
+    let output = tool(&[
+        "smoke".into(),
+        bundle.as_os_str().into(),
+        "--variant".into(),
+        "b".into(),
+        "--".into(),
+        "context".into(),
+        OsString::from_vec(b"arg\xff".to_vec()),
+    ]);
+    success(&output);
+    let mut expected = b"b\0".to_vec();
+    expected.extend_from_slice(bundle.as_os_str().as_bytes());
+    expected.extend_from_slice(b"\0context\0arg\xff\0");
+    assert!(output.stdout.starts_with(&expected));
+    let output = tool(&[
+        "smoke".into(),
+        bundle.as_os_str().into(),
+        "--variant".into(),
+        "b".into(),
+        "--".into(),
+        "exit".into(),
+        "27".into(),
+    ]);
+    assert_eq!(output.status.code(), Some(27));
+    assert!(output.stderr.is_empty());
+    let output = tool(&[
+        "smoke".into(),
+        bundle.as_os_str().into(),
+        "--variant".into(),
+        "missing".into(),
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown payload"));
 }

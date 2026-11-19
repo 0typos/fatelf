@@ -523,7 +523,7 @@ fn doctor_reports_missing_interpreter_without_building() {
         .unwrap();
     assert_eq!(report.status.code(), Some(1));
     let report: Value = serde_json::from_slice(&report.stdout).unwrap();
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["ok"], false);
     let checks = report["checks"].as_array().unwrap();
     assert!(checks.iter().any(|check| {
@@ -544,6 +544,72 @@ fn doctor_reports_missing_interpreter_without_building() {
             .any(|check| { check["code"] == "memfd_probe" && check["status"] == "skipped" })
     );
     assert!(!path.join("combined").exists());
+}
+
+#[test]
+fn doctor_warns_about_origin_and_relative_loader_paths_before_building() {
+    let directory = tempdir().unwrap();
+    let dir = directory.path();
+    let source = dir.join("app.c");
+    let config_path = dir.join("bundle.toml");
+    fs::write(&source, "int main(void) { return 0; }").unwrap();
+    for (runpath, message) in [
+        ("${ORIGIN}/lib", "uses $ORIGIN"),
+        ("relative/lib", "relative search path"),
+        ("/usr/lib", ""),
+    ] {
+        let payload = dir.join("app");
+        success(
+            &Command::new("cc")
+                .arg(&source)
+                .arg(format!("-Wl,-rpath,{runpath}"))
+                .arg("-o")
+                .arg(&payload)
+                .output()
+                .unwrap(),
+        );
+        let mut config = settings("combined");
+        config["payloads"] =
+            json!([{"name":"a","path":payload},{"name":"b","path":"/usr/bin/true"}]);
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        for strict in [false, true] {
+            let mut args = vec![
+                "doctor".into(),
+                "--json".into(),
+                "--config".into(),
+                config_path.as_os_str().into(),
+            ];
+            if strict {
+                args.push("--strict".into());
+            }
+            let report = tool(&args, dir);
+            let ok = !strict || message.is_empty();
+            assert_eq!(
+                report.status.success(),
+                ok,
+                "{runpath}: {}",
+                String::from_utf8_lossy(&report.stderr)
+            );
+            let report: Value = serde_json::from_slice(&report.stdout).unwrap();
+            assert_eq!(report["ok"], ok);
+            let entry = report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["code"] == "payload_loader_paths" && entry["subject"] == "a")
+                .unwrap();
+            assert_eq!(
+                entry["status"],
+                if message.is_empty() { "ok" } else { "warning" },
+                "{runpath}"
+            );
+            assert!(
+                entry["detail"].as_str().unwrap().contains(message),
+                "{runpath}: {entry}"
+            );
+            assert!(!dir.join("combined").exists());
+        }
+    }
 }
 
 #[test]

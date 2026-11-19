@@ -1,8 +1,11 @@
 //! Packer commands and concise machine-readable container inspection.
 
 use std::{
+    ffi::OsString,
     io::{self, Write},
-    path::PathBuf,
+    os::unix::process::CommandExt,
+    path::{PathBuf, absolute},
+    process::Command as ProcessCommand,
 };
 
 use clap::{Parser, Subcommand};
@@ -54,6 +57,9 @@ enum Command {
         /// Try allocating an empty executable memfd when configured.
         #[arg(long)]
         probe: bool,
+        /// Treat deployment warnings as failures.
+        #[arg(long)]
+        strict: bool,
     },
     /// Edit build settings interactively, save TOML, and optionally run build.
     Configure {
@@ -70,6 +76,14 @@ enum Command {
     Inspect { input: PathBuf },
     /// Verify every payload without running it or writing extracted files.
     Verify { input: PathBuf },
+    /// Run one trusted bundle variant with explicit smoke-test arguments.
+    Smoke {
+        input: PathBuf,
+        #[arg(long)]
+        variant: String,
+        #[arg(last = true)]
+        args: Vec<OsString>,
+    },
     /// Recover an original executable byte-for-byte to a new output path.
     Extract {
         input: PathBuf,
@@ -107,13 +121,31 @@ pub(crate) fn run() -> Result<(), Error> {
             config,
             json,
             probe,
-        } => doctor::run(&config, json, probe),
+            strict,
+        } => doctor::run(&config, json, probe, strict),
         Command::Configure { config, output } => tui::run(config.as_deref(), output.as_deref()),
         Command::Extract {
             input,
             variant,
             output,
         } => extract(&input, &variant, &output),
+        Command::Smoke {
+            input,
+            variant,
+            args,
+        } => {
+            let path = absolute(&input)?;
+            let container = Container::open_path(&path)?;
+            container.payload_index(&variant)?;
+            let selector = container.manifest.select_env.clone();
+            drop(container);
+            Err(ProcessCommand::new(path)
+                .arg0(input)
+                .args(args)
+                .env(selector, variant)
+                .exec()
+                .into())
+        }
         Command::Verify { input } => {
             let mut container = Container::open_path(&input)?;
             let mut output = io::sink();

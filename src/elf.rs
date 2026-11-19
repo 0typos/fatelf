@@ -4,17 +4,18 @@ use std::mem::size_of;
 #[cfg(feature = "builder")]
 use std::{
     cell::Cell,
+    ffi::OsStr,
     fs::{File, OpenOptions},
     io::Read,
     ops::Range,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::Path,
 };
 
 #[cfg(feature = "builder")]
 use object::{
-    Architecture, BinaryFormat, Object, ObjectKind, ObjectSection, ReadCache, ReadRef,
-    read::elf::{ElfFile, ProgramHeader},
+    Architecture, BinaryFormat, Object, ObjectKind, ObjectSection, ReadCache, ReadRef, elf,
+    read::elf::{Dyn, ElfFile, ProgramHeader},
 };
 use object::{
     Endianness,
@@ -142,6 +143,7 @@ pub(crate) struct ElfMetadata {
     pub(crate) architecture: Architecture,
     pub(crate) little_endian: bool,
     pub(crate) interpreter: Option<Vec<u8>>,
+    pub(crate) loader_path_warning: Option<String>,
     pub(crate) codecs: Option<crate::capabilities::LauncherCodecs>,
 }
 
@@ -168,6 +170,7 @@ impl ElfMetadata {
             architecture: elf.architecture(),
             little_endian: elf.is_little_endian(),
             interpreter: interpreter.map(<[u8]>::to_vec),
+            loader_path_warning: loader_path_warning(&elf)?,
             codecs: launcher
                 .then(|| crate::capabilities::launcher_codecs(&elf))
                 .transpose()?,
@@ -202,9 +205,131 @@ impl<'a> ReadRef<'a> for MetadataReader<'a> {
         }
         let limit = range.end.checked_sub(range.start).ok_or(())?.min(4096);
         self.1.set(self.1.get().checked_sub(limit).ok_or(())?);
-        self.0
-            .read_bytes_at_until(range.start..range.start + limit, delimiter)
+        let bytes = self
+            .0
+            .read_bytes_at_until(range.start..range.start + limit, delimiter)?;
+        // ReadCache may return a string cached for a wider range at this offset.
+        if bytes.len() as u64 >= limit {
+            return Err(());
+        }
+        Ok(bytes)
     }
+}
+
+/// Inspect loader path tags through program headers so section names are optional.
+#[cfg(feature = "builder")]
+pub(crate) fn loader_path_warning<'data, R: ReadRef<'data>>(
+    file: &object::File<'data, R>,
+) -> Result<Option<String>, Error> {
+    match file {
+        object::File::Elf32(file) => dynamic_paths(file),
+        object::File::Elf64(file) => dynamic_paths(file),
+        _ => Ok(None),
+    }
+}
+
+/// Identify the first path that can change meaning when the executable moves.
+#[cfg(feature = "builder")]
+fn dynamic_paths<'data, E: FileHeader, R: ReadRef<'data>>(
+    file: &ElfFile<'data, E, R>,
+) -> Result<Option<String>, Error> {
+    let endian = file.endian();
+    let headers = file.elf_program_headers();
+    let Some(segment) = headers
+        .iter()
+        .find(|header| header.p_type(endian) == elf::PT_DYNAMIC)
+    else {
+        return Ok(None);
+    };
+    let dynamic = segment.dynamic(endian, file.data())?.unwrap_or_default();
+    let terminator = dynamic
+        .iter()
+        .position(|entry| entry.tag32(endian) == Some(elf::DT_NULL))
+        .ok_or_else(|| Error::Invalid("ELF dynamic segment has no DT_NULL terminator".into()))?;
+    let entries = dynamic[..terminator].iter();
+    let has_runpath = entries
+        .clone()
+        .any(|entry| entry.tag32(endian) == Some(elf::DT_RUNPATH));
+    let paths = entries.clone().filter(|entry| match entry.tag32(endian) {
+        Some(elf::DT_NEEDED | elf::DT_RUNPATH) => true,
+        Some(elf::DT_RPATH) => !has_runpath,
+        _ => false,
+    });
+    if paths.clone().next().is_none() {
+        return Ok(None);
+    }
+    let value = |tag| -> Result<u64, Error> {
+        entries
+            .clone()
+            .find(|entry| entry.tag32(endian) == Some(tag))
+            .map(|entry| entry.d_val(endian).into())
+            .ok_or_else(|| Error::Invalid("ELF dynamic string table is missing".into()))
+    };
+    let address = value(elf::DT_STRTAB)?;
+    let size = value(elf::DT_STRSZ)?;
+    let base = headers
+        .iter()
+        .filter(|header| header.p_type(endian) == elf::PT_LOAD)
+        .find_map(|header| {
+            let delta = address.checked_sub(header.p_vaddr(endian).into())?;
+            let (offset, length) = header.file_range(endian);
+            (delta.checked_add(size)? <= length).then_some(())?;
+            offset.checked_add(delta)
+        })
+        .ok_or_else(|| {
+            Error::Invalid("ELF dynamic string table is outside file-backed segments".into())
+        })?;
+    let end = base
+        .checked_add(size)
+        .ok_or_else(|| Error::Invalid("ELF dynamic string table range overflow".into()))?;
+    if !file.data().len().is_ok_and(|length| end <= length) {
+        return Err(Error::Invalid(
+            "ELF dynamic string table is outside the file".into(),
+        ));
+    }
+    for entry in paths {
+        let offset = base
+            .checked_add(entry.d_val(endian).into())
+            .filter(|&offset| offset < end)
+            .ok_or_else(|| Error::Invalid("ELF loader path is outside its string table".into()))?;
+        let bytes = file
+            .data()
+            .read_bytes_at_until(offset..end.min(offset.saturating_add(4096)), 0)
+            .map_err(|_| Error::Invalid("could not read bounded ELF loader path".into()))?;
+        let path = String::from_utf8_lossy(bytes);
+        let origin = path.contains("${ORIGIN}")
+            || path.match_indices("$ORIGIN").any(|(start, token)| {
+                path.as_bytes()
+                    .get(start + token.len())
+                    .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+            });
+        let (tag, relative) = match entry.tag32(endian) {
+            Some(elf::DT_NEEDED) => (
+                "DT_NEEDED",
+                bytes.contains(&b'/') && !bytes.starts_with(b"/"),
+            ),
+            Some(elf::DT_RUNPATH) => (
+                "DT_RUNPATH",
+                !path.is_empty() && path.split(':').any(|part| !part.starts_with('/')),
+            ),
+            _ => (
+                "DT_RPATH",
+                !path.is_empty() && path.split(':').any(|part| !part.starts_with('/')),
+            ),
+        };
+        let display = OsStr::from_bytes(bytes);
+        if origin {
+            return Ok(Some(format!(
+                "{tag} {display:?} uses $ORIGIN; reconstructed payloads do not retain their original executable directory"
+            )));
+        }
+        if relative {
+            return Ok(Some(format!(
+                "{tag} {display:?} contains a relative search path; startup can depend on the working directory"
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// Read PT_INTERP through the same object reader for ELF32 and ELF64.
@@ -410,6 +535,7 @@ mod tests {
             Ok(b"suffix".as_slice())
         );
         assert_eq!(input.read_bytes_at_until(0..7, 0), Ok(b"prefix".as_slice()));
+        assert!(input.read_bytes_at_until(0..6, 0).is_err());
         assert!(input.read_bytes_at_until(7..15, 0).is_err());
     }
 }

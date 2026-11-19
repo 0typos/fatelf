@@ -8,16 +8,6 @@ use object::{Object, ObjectSection};
 const COMPRESSION: u8 = 1;
 const ENCRYPTION: u8 = 2;
 
-/// Separate marker keeps the original descriptor readable by older builders.
-#[used]
-#[unsafe(link_section = ".fatelf.xor")]
-static XOR_DESCRIPTOR: [u8; 8] = *b"FATXOR01";
-
-/// Separate extension marker keeps fixed-XOR launchers distinguishable.
-#[used]
-#[unsafe(link_section = ".fatelf.xormask")]
-static XOR_MASK_DESCRIPTOR: [u8; 8] = *b"FATXOR02";
-
 /// Allocated descriptor survives stripping; the entrypoint references it as well.
 #[used]
 #[unsafe(link_section = ".fatelf")]
@@ -29,7 +19,7 @@ static DESCRIPTOR: [u8; 16] = [
     b'A',
     b'P',
     b'0',
-    b'2',
+    b'3',
     (cfg!(feature = "compression") as u8 * COMPRESSION)
         | (cfg!(feature = "encryption") as u8 * ENCRYPTION),
     0,
@@ -43,40 +33,27 @@ static DESCRIPTOR: [u8; 16] = [
 
 /// Keep the capability descriptor reachable when the runtime is linked and stripped.
 pub(crate) fn retain() {
-    std::hint::black_box((&DESCRIPTOR, &XOR_DESCRIPTOR, &XOR_MASK_DESCRIPTOR));
+    std::hint::black_box(&DESCRIPTOR);
 }
 
-/// Reject old or insufficient supplied launchers before constructing a new container.
-#[cfg(feature = "builder")]
-pub(crate) fn validate_launcher(bytes: &[u8], required: LauncherCodecs) -> Result<(), Error> {
-    let supported = launcher_codecs(&object::File::parse(bytes)?)?;
-    if required.xor_mask && !supported.xor_mask {
-        return Err(Error::Invalid(
-            "launcher does not support variable payload XOR".into(),
-        ));
-    }
-    if required.xor && !supported.xor {
-        return Err(Error::Invalid(
-            "launcher does not support payload XOR".into(),
-        ));
-    }
-    if required.compression && !supported.compression
-        || required.encryption && !supported.encryption
-    {
-        return Err(Error::Invalid(
-            "launcher does not support the selected codecs".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Named decoder support declared by a launcher.
+/// Decoder options of a launcher with the current compatibility revision.
 #[cfg(feature = "builder")]
 pub(crate) struct LauncherCodecs {
     pub(crate) compression: bool,
     pub(crate) encryption: bool,
-    pub(crate) xor: bool,
-    pub(crate) xor_mask: bool,
+}
+
+#[cfg(feature = "builder")]
+impl LauncherCodecs {
+    /// Check the optional codecs actually used by the prepared bundle.
+    pub(crate) fn validate(&self, required: Self) -> Result<(), Error> {
+        if required.compression && !self.compression || required.encryption && !self.encryption {
+            return Err(Error::Invalid(
+                "launcher does not support the selected codecs".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Read the launcher descriptor without executing it.
@@ -87,7 +64,7 @@ pub(crate) fn launcher_codecs<'data>(elf: &impl Object<'data>) -> Result<Launche
         .filter(|section| section.name() == Ok(".fatelf"));
     let section = sections
         .next()
-        .ok_or_else(|| Error::Invalid("launcher lacks v2 capability descriptor".into()))?;
+        .ok_or_else(|| Error::Invalid("launcher lacks a capability descriptor; rebuild or install the launcher paired with this fatelf".into()))?;
     if section.size() != DESCRIPTOR.len() as u64 {
         return Err(Error::Invalid(
             "invalid launcher capability descriptor".into(),
@@ -96,7 +73,7 @@ pub(crate) fn launcher_codecs<'data>(elf: &impl Object<'data>) -> Result<Launche
     let descriptor = section.data()?;
     if sections.next().is_some()
         || descriptor.len() != 16
-        || &descriptor[..8] != b"FATCAP02"
+        || &descriptor[..6] != b"FATCAP"
         || descriptor[8] & !(COMPRESSION | ENCRYPTION) != 0
         || descriptor[9..].iter().any(|&byte| byte != 0)
     {
@@ -104,14 +81,15 @@ pub(crate) fn launcher_codecs<'data>(elf: &impl Object<'data>) -> Result<Launche
             "invalid launcher capability descriptor".into(),
         ));
     }
+    if descriptor[..8] != DESCRIPTOR[..8] {
+        let expected = String::from_utf8_lossy(&DESCRIPTOR[..8]);
+        let actual = String::from_utf8_lossy(&descriptor[..8]);
+        return Err(Error::Invalid(format!(
+            "launcher compatibility revision {actual:?} does not match {expected}; rebuild or install the launcher paired with this fatelf"
+        )));
+    }
     Ok(LauncherCodecs {
         compression: descriptor[8] & COMPRESSION != 0,
         encryption: descriptor[8] & ENCRYPTION != 0,
-        xor: elf
-            .section_by_name(".fatelf.xor")
-            .is_some_and(|section| section.data() == Ok(XOR_DESCRIPTOR.as_slice())),
-        xor_mask: elf
-            .section_by_name(".fatelf.xormask")
-            .is_some_and(|section| section.data() == Ok(XOR_MASK_DESCRIPTOR.as_slice())),
     })
 }

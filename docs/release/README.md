@@ -31,6 +31,10 @@ compressed bundles as part of format changes. Breaking wire changes need a
 new format version and migration guidance. The config schema is independently
 versioned in the TOML file.
 
+Ship the packer and launcher together. New builds require the packer's
+current launcher compatibility revision. Update that revision when the packer
+can generate bundles that the previous launcher revision cannot run.
+
 ## Prepare binary artifacts
 
 Run `just release-check` first, then use a reviewed notice file for the exact

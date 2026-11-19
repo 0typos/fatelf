@@ -2,10 +2,11 @@
 
 | Command | When to use it |
 |---|---|
-| `fatelf doctor --config bundle.toml --probe` | Diagnose inputs, interpreter paths, output placement, and temporary storage on this host. The optional memfd probe allocates an empty descriptor. |
+| `fatelf doctor --config bundle.toml --strict --probe` | Check launcher revision, location-dependent ELF loader paths, interpreter paths, and host storage. The optional memfd probe allocates an empty descriptor. |
 | `fatelf plan --config bundle.toml` | Check build policies and get exact output sizes before publishing. It reads used build keys and uses the same temporary spool as a build. |
 | `fatelf inspect ./combined` | List payloads, selection policy, and storage statistics from an existing bundle. |
 | `fatelf verify ./combined` | Reconstruct every payload without execution and validate its digest. Supply all required runtime key files. |
+| `fatelf smoke ./combined --variant example -- --version` | Execute the named variant of a trusted bundle with application-specific test arguments and return its exit status. |
 
 | Symptom | Check and action |
 |---|---|
@@ -50,28 +51,38 @@
 
 ```sh
 fatelf doctor --config bundle.toml
-fatelf doctor --config bundle.toml --json --probe
+fatelf doctor --config bundle.toml --json --strict --probe
 ```
 
-`doctor` checks the config, launcher descriptor, payload compatibility with
-the launcher, ELF interpreter paths, temporary storage, and output destination
-on the current host. The ELF metadata read budget is 16 MiB per input.
-An output directory may be writable on a `noexec` mount. In that case the
-output check describes the restriction while allowing staging there.
-`doctor` creates no bundle, reads no key files, and runs no
-payload. `--probe` also creates and closes an empty executable memfd if the
-config selects that backend. The probe does not attempt `execveat`.
+`doctor` checks the configuration, current launcher compatibility revision,
+payload architecture, ELF interpreter paths, temporary storage, and output
+destination on this host. It reports a warning for `$ORIGIN` or relative
+loader paths in `DT_NEEDED`, `DT_RUNPATH`, and the fallback `DT_RPATH`.
+It reports the first risk for each executable. Those paths may
+resolve differently from a reconstructed payload. This check uses program
+headers, covers binaries without section names, and runs neither the loader
+nor the payload. The metadata read budget is 16 MiB per input. See the
+[ELF dynamic section](https://gabi.xinuos.com/elf/08-dynamic.html#dynamic-section)
+and [Linux loader rules](https://man7.org/linux/man-pages/man8/ld.so.8.html#DESCRIPTION).
 
-Exit status 0 means the checks found no failures. Status 1 means a check or
-reporting operation failed. CLI usage errors exit 2. JSON reports use
-`schema_version: 1`, an `ok` boolean, and a `checks` array. Each check has a
-stable `code`, a `status` of `ok`, `error`, or `skipped`, a `subject`, and
-human-readable `detail`. Check codes are `config`, `launcher`,
-`launcher_interpreter`, `payload_elf`, `interpreter`, `temporary_storage`,
-`output`, and `memfd_probe`. Host conditions may change after the report. Relative interpreter paths resolve from
-the working directory of the invoking process. Use `plan` for exact storage sizes
-and to check whether the chosen codecs fit the supplied launcher. Use
-`verify` for a completed bundle.
+Use `--strict` to make warnings fail the gate. Exit status 0 means no failures,
+status 1 means a check or reporting operation failed, and CLI usage errors exit
+2. JSON reports use `schema_version: 2` and statuses `ok`, `warning`, `error`,
+and `skipped`. The new check codes are `launcher_loader_paths` and
+`payload_loader_paths`. An output directory may still be writable on a
+`noexec` mount. The optional memfd probe allocates and closes an empty descriptor.
+
+Build with the launcher from the same installation. `doctor`, `plan`,
+`pack`, and `build` reject a stale launcher. `plan` additionally checks
+whether the chosen optional codecs fit that launcher's build profile.
+
+After building, run `verify` to check reconstructed bytes, then run `smoke`
+for each trusted variant from its intended deployment path, working directory,
+and environment. Supply any runtime keys and use arguments with a known exit
+status for that application, such as `--version` where supported. Smoke
+executes the actual bundle with its configured selector. Metadata inspection
+cannot validate transitive dependencies, runtime-loaded libraries, or adjacent
+application resources.
 
 ## Verify a bundle
 

@@ -61,12 +61,13 @@ authentication tag. The recorded object length includes the tag.
 Nonces/lengths/offsets are finalized before encryption; ciphertext tags are not
 manifest fields, avoiding a circular commitment.
 
-Payload XOR is an opt-in v2 encoding extension. Builders require an ELF
-`.fatelf.xor` section containing exactly the eight ASCII bytes `FATXOR01` when
-writing `xor-a5` objects. For `xor-mask` objects, builders require
-`.fatelf.xormask` containing `FATXOR02`. These markers preserve the original
-`.fatelf` descriptor. A reader without the corresponding extension rejects
-that encoding. New readers also accept earlier v2 bundles.
+Current builders require a single 16-byte `.fatelf` launcher descriptor.
+Its first eight bytes are ASCII `FATCAP03`, byte 8 carries the optional LZ4
+and AEAD capability bits (bits 0 and 1), and the seven remaining bytes are
+zero. This launcher compatibility revision covers both XOR encodings and is
+independent of the v2 container format. Upgrade the packer and launcher as a
+pair when building new bundles. Existing v2 bundles retain their own launcher
+and can still be inspected, verified, and extracted by current tools.
 
 **Version break:** TOML schema and container format are independently version 2.
 v1 configs/readers are unsupported; existing standalone v1 executables retain

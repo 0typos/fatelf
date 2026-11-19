@@ -102,8 +102,8 @@ For a repeating mask, run `fatelf xor-mask 16` and copy the printed
 `xor_mask = [...]` line into `[storage]` instead of setting `xor = true`.
 The generator accepts **1–32 bytes** and draws a new public mask from the OS
 on each invocation. Save the generated line once so `plan` and repeated
-builds use the same mask. This setting requires a launcher that supports
-variable payload XOR. The mask is stored in the bundle.
+builds use the same mask. The launcher paired with this build of Fatelf supports variable payload XOR.
+The mask is stored in the bundle.
 
 Compression/encryption/shuffle inherit global → payload → region settings.
 `storage.encryption` supplies an optional default key ID; `encryption = "none"`

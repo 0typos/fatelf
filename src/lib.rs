@@ -42,6 +42,9 @@ pub fn run_launcher() -> Result<(), Error> {
 /// Exercise both container metadata validation and reconstruction for fuzzing.
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_container(bytes: &[u8]) {
+    if let Ok(file) = object::File::parse(bytes) {
+        let _ = elf::loader_path_warning(&file);
+    }
     // Exercise codec input directly even when container mutations fail metadata validation.
     if let Some(prefix) = bytes.get(..3) {
         let decoded_length = usize::from(u16::from_le_bytes([prefix[1], prefix[2]])) + 1;

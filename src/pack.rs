@@ -421,6 +421,8 @@ impl PackOptions {
         self.validate()?;
         let launcher_path = self.launcher_path()?;
         let launcher = Elf::read(&launcher_path)?;
+        let launcher_codecs =
+            capabilities::launcher_codecs(&object::File::parse(launcher.bytes.as_slice())?)?;
         let mut pool = Pool::new(
             self.budgets.clone(),
             self.xor_mask.as_deref().unwrap_or_default(),
@@ -493,15 +495,10 @@ impl PackOptions {
         }
         let (chunks, pool_length) = pool.layout(self.order, self.seed)?;
         let mask_required = chunks.iter().any(|c| c.encoding == Encoding::XorMask);
-        capabilities::validate_launcher(
-            &launcher.bytes,
-            LauncherCodecs {
-                compression: chunks.iter().any(|c| c.codec == StoredCodec::Lz4Block),
-                encryption: chunks.iter().any(|c| c.encryption.is_some()),
-                xor: chunks.iter().any(|c| c.encoding == Encoding::XorA5),
-                xor_mask: mask_required,
-            },
-        )?;
+        launcher_codecs.validate(LauncherCodecs {
+            compression: chunks.iter().any(|c| c.codec == StoredCodec::Lz4Block),
+            encryption: chunks.iter().any(|c| c.encryption.is_some()),
+        })?;
         let used: HashSet<&str> = chunks
             .iter()
             .filter_map(|c| c.encryption.as_ref().map(|e| e.key.as_str()))
