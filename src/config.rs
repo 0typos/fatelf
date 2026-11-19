@@ -430,6 +430,31 @@ mod tests {
     }
 
     #[test]
+    fn new_editor_drafts_require_payload_paths_and_resolve_relative_destinations() {
+        let draft = BuildConfig::draft();
+        assert_eq!(draft.output, Path::new("combined"));
+        assert_eq!(
+            draft
+                .payloads
+                .iter()
+                .map(|input| input.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(
+            draft
+                .payloads
+                .iter()
+                .all(|input| input.path.as_os_str().is_empty())
+        );
+        assert!(draft.encode().is_err());
+        assert_eq!(
+            destination(Path::new("bundle.toml")).unwrap(),
+            fs::canonicalize(".").unwrap().join("bundle.toml")
+        );
+    }
+
+    #[test]
     fn key_files_rebase_and_validate_without_embedding_material() {
         let mut config = settings();
         config.keys.push(KeyConfig {
@@ -530,5 +555,102 @@ mod tests {
             before.inputs.iter().map(|p| &p.path).collect::<Vec<_>>(),
             after.inputs.iter().map(|p| &p.path).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn config_snapshot_rejects_links_and_accepts_exactly_one_mib() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut text = settings().encode().unwrap();
+        text.push('\n');
+        text.push('#');
+        text.extend(std::iter::repeat_n(' ', MAX_CONFIG - text.len()));
+        fs::write(&path, &text).unwrap();
+        assert_eq!(read_config(&path).unwrap().0, text.as_bytes());
+        assert!(Document::load(&path).is_ok());
+        let link = directory.path().join("link.toml");
+        symlink(&path, &link).unwrap();
+        assert!(read_config(&link).is_err());
+        assert!(Document::load(&link).is_ok());
+        let error = read_config(directory.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("configuration must be a regular file")
+        );
+        text.push(' ');
+        fs::write(&path, &text).unwrap();
+        let error = read_config(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("configuration must be a regular file")
+        );
+        assert!(BuildConfig::parse(&text).is_err());
+        fs::write(&path, [0xff]).unwrap();
+        let error = Document::load(&path).err().unwrap();
+        assert_eq!(error.to_string(), "configuration must be UTF-8");
+    }
+
+    #[test]
+    fn config_encoder_accepts_exactly_one_mib() {
+        let mut config = settings();
+        let length = config.encode().unwrap().len();
+        config
+            .output
+            .as_mut_os_string()
+            .push("x".repeat(MAX_CONFIG - length));
+        let text = config.encode().unwrap();
+        assert_eq!(text.len(), MAX_CONFIG);
+        config.output.as_mut_os_string().push("x");
+        assert!(config.encode().is_err());
+    }
+
+    #[test]
+    fn save_preserves_an_owner_or_group_that_differs_from_the_staged_file() {
+        let gid = rustix::process::getegid();
+        let root = rustix::process::geteuid().is_root();
+        let alternate_gid = if root {
+            Some(Gid::from_raw(if gid.as_raw() == 1 { 2 } else { 1 }))
+        } else {
+            rustix::process::getgroups()
+                .unwrap()
+                .into_iter()
+                .find(|&candidate| candidate != gid)
+        };
+        let alternate_uid = root.then(|| Uid::from_raw(1));
+        for (owner, group) in [(None, alternate_gid), (alternate_uid, None)] {
+            if owner.is_none() && group.is_none() {
+                continue;
+            }
+            let source = tempfile::tempfile().unwrap();
+            let staged = tempfile::tempfile().unwrap();
+            match fchown(&source, owner, group) {
+                Ok(()) => {}
+                // A restricted test runner may lack CAP_CHOWN or only map one ID.
+                Err(Errno::PERM | Errno::INVAL) => continue,
+                Err(error) => panic!("could not set fixture ownership: {error}"),
+            }
+            preserve_access(&source, &staged).unwrap();
+            let source = source.metadata().unwrap();
+            let staged = staged.metadata().unwrap();
+            assert_eq!((staged.uid(), staged.gid()), (source.uid(), source.gid()));
+        }
+    }
+
+    #[test]
+    fn encoded_and_decoded_configs_share_the_configured_byte_limit() {
+        let mut config = settings();
+        config.budgets.max_config_bytes = 4096;
+        config.budgets.max_config_bytes = config.encode().unwrap().len() as u64;
+        config.budgets.max_config_bytes = config.encode().unwrap().len() as u64;
+        let mut text = config.encode().unwrap();
+        assert_eq!(text.len() as u64, config.budgets.max_config_bytes);
+        assert!(BuildConfig::parse(&text).is_ok());
+        text.push(' ');
+        assert!(BuildConfig::parse(&text).is_err());
+
+        config.budgets.max_config_bytes = 16;
+        assert!(config.encode().is_err());
     }
 }

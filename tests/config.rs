@@ -197,6 +197,32 @@ fn config_size_and_terminal_requirements_fail_cleanly() {
 }
 
 #[test]
+fn config_read_checks_actual_bytes_even_when_procfs_reports_zero() {
+    const PADDING_LEN: usize = 120_000;
+    const PADDING_KEYS: usize = 9;
+    // SAFETY: sysconf takes a fixed selector and does not use caller memory.
+    let argument_limit = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+    if argument_limit < (PADDING_LEN * PADDING_KEYS + 4096) as libc::c_long {
+        return;
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fatelf"));
+    command
+        .args(["build", "--config", "/proc/self/environ"])
+        .env_clear();
+    let padding = "x".repeat(PADDING_LEN);
+    for index in 0..PADDING_KEYS {
+        command.env(format!("FATELF_TEST_PADDING_{index}"), &padding);
+    }
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("configuration exceeds 1 MiB"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn single_payload_front_manifest_plan_predicts_exact_output_size() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("bundle.toml");
