@@ -4,6 +4,12 @@
 
 <h1 align="center">Many programs. One executable.</h1>
 
+<p align="center">
+  <a href="https://github.com/0typos/fatelf/releases"><img alt="Release: beta" src="assets/brand/badge-release.svg"></a>
+  <a href="docs/operations.md#execution-boundaries"><img alt="Platform: Linux x86-64" src="assets/brand/badge-platform.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="assets/brand/badge-license.svg"></a>
+</p>
+
 Fatelf packs several Linux ELF executables into one runnable file. Ship a
 single artifact containing, for example, a service and its diagnostic tool,
 or two builds of the same command. An environment variable selects the payload,
