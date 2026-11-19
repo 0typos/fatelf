@@ -87,8 +87,15 @@ pub(crate) struct Storage {
     pub(crate) ranges: Vec<String>,
     pub(crate) manifest_position: Position,
     pub(crate) compression: Compression,
+    #[serde(skip_serializing_if = "is_false")]
+    pub(crate) xor: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) encryption: Option<String>,
+}
+
+/// Omit disabled XOR from saved configs so older builders can read them.
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl Default for Storage {
@@ -103,6 +110,7 @@ impl Default for Storage {
             ranges: Vec::new(),
             manifest_position: Position::End,
             compression: Compression::None,
+            xor: false,
             encryption: None,
         }
     }
@@ -209,6 +217,7 @@ impl BuildConfig {
             chunk_size: self.storage.chunk_size,
             shuffle_payloads: Vec::new(),
             compression: self.storage.compression,
+            xor: self.storage.xor,
             manifest_position: self.storage.manifest_position,
             encryption: self.storage.encryption.clone(),
             keys: self

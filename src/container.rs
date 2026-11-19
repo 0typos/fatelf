@@ -304,13 +304,10 @@ impl Manifest {
                     .chunks
                     .get(index)
                     .ok_or_else(|| Error::Invalid("invalid object reference".into()))?;
-                let expected = if ordinal == 0 {
-                    Encoding::ElfHeaderXorA5
-                } else {
-                    Encoding::Identity
-                };
-                if chunk.encoding != expected
-                    || ordinal == 0 && chunk.decoded_length != payload.header_length
+                if ordinal == 0
+                    && (chunk.encoding != Encoding::ElfHeaderXorA5
+                        || chunk.decoded_length != payload.header_length)
+                    || ordinal != 0 && chunk.encoding == Encoding::ElfHeaderXorA5
                 {
                     return Err(Error::Invalid(
                         "payload must begin with a complete masked header object".into(),

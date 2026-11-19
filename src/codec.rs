@@ -41,6 +41,7 @@ pub(crate) enum StoredCodec {
 pub(crate) enum Encoding {
     Identity,
     ElfHeaderXorA5,
+    XorA5,
 }
 
 /// External-key identity and fresh nonce needed to authenticate a stored object.
@@ -327,9 +328,9 @@ fn validate_length(length: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// Apply the fixed public header mask; the operation is its own inverse.
+/// Apply the fixed public byte mask; the operation is its own inverse.
 fn apply_encoding(bytes: &mut [u8], encoding: Encoding) {
-    if encoding == Encoding::ElfHeaderXorA5 {
+    if matches!(encoding, Encoding::ElfHeaderXorA5 | Encoding::XorA5) {
         for byte in bytes {
             *byte ^= 0xa5;
         }

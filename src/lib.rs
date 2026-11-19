@@ -50,7 +50,9 @@ pub fn fuzz_container(bytes: &[u8]) {
         } else {
             codec::StoredCodec::Lz4Block
         };
-        let encoding = if prefix[0] & 2 == 0 {
+        let encoding = if prefix[0] & 4 != 0 {
+            codec::Encoding::XorA5
+        } else if prefix[0] & 2 == 0 {
             codec::Encoding::Identity
         } else {
             codec::Encoding::ElfHeaderXorA5

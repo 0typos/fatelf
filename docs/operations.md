@@ -84,9 +84,9 @@ without reading payload data.
 
 ## Security boundaries
 
-Header XOR and shuffling are reversible obfuscation. They remove deliberately
-verbatim source headers, not every incidental ELF magic sequence; the launcher
-may contain parser constants. The readable JSON and `FATELF02` footer identify
+Header XOR, optional payload XOR, and shuffling are reversible obfuscation.
+The launcher may still contain ELF parser constants and incidental magic sequences.
+The readable JSON and `FATELF02` footer identify
 the container. Compression, entropy, and header masking do not make it invisible.
 
 External-key AEAD protects encrypted stored bytes from a container holder lacking

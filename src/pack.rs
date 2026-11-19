@@ -19,7 +19,7 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 use crate::{
-    capabilities,
+    capabilities::{self, LauncherCodecs},
     codec::{self, Compression, Encoding, Encryption, StoredCodec},
     container::{
         Backend, Budgets, Chunk, Container, FOOTER_LEN, Footer, MAGIC, MAX_CHUNK, Manifest,
@@ -181,6 +181,9 @@ pub(crate) struct PackOptions {
     /// Compress objects only when the encoded form is smaller.
     #[arg(long, value_enum, default_value = "none")]
     pub(crate) compression: Compression,
+    /// Mask payload bodies with public XOR (0xA5), without a key.
+    #[arg(long)]
+    pub(crate) xor: bool,
     /// Place the readable manifest after the launcher or after the stored pool.
     #[arg(long, value_enum, default_value = "end")]
     pub(crate) manifest_position: Position,
@@ -411,6 +414,11 @@ impl PackOptions {
         let launcher = Elf::read(&launcher_path)?;
         let mut pool = Pool::new(self.budgets.clone())?;
         let mut payloads = Vec::new();
+        let body_encoding = if self.xor {
+            Encoding::XorA5
+        } else {
+            Encoding::Identity
+        };
         let mut logical = 0_u64;
         let mut references = 0_usize;
         for input in &self.inputs {
@@ -453,7 +461,7 @@ impl PackOptions {
                                 "too many payload object references".into(),
                             ));
                         }
-                        chunks.push(pool.insert(bytes, Encoding::Identity, &policy, self.dedup)?);
+                        chunks.push(pool.insert(bytes, body_encoding, &policy, self.dedup)?);
                     }
                 }
             }
@@ -470,12 +478,13 @@ impl PackOptions {
             });
         }
         let (chunks, pool_length) = pool.layout(self.order, self.seed)?;
-        let compression_required = chunks.iter().any(|c| c.codec == StoredCodec::Lz4Block);
-        let encryption_required = chunks.iter().any(|c| c.encryption.is_some());
         capabilities::validate_launcher(
             &launcher.bytes,
-            compression_required,
-            encryption_required,
+            LauncherCodecs {
+                compression: chunks.iter().any(|c| c.codec == StoredCodec::Lz4Block),
+                encryption: chunks.iter().any(|c| c.encryption.is_some()),
+                xor: chunks.iter().any(|c| c.encoding == Encoding::XorA5),
+            },
         )?;
         let used: HashSet<&str> = chunks
             .iter()

@@ -85,13 +85,18 @@ in this release; inherited key descriptors/providers and secret delivery are lat
 |---|---|
 | Layout | `overlay`, with `front` or `end` manifest placement |
 | Chunking | Fixed size, 256 bytes–1 MiB; default 4096 |
-| Source encoding | Mandatory full-header `elf-header-xor-a5`; body `identity` |
+| Source encoding | Mandatory full-header `elf-header-xor-a5`; body `identity` or `xor-a5` |
 | Compression | `none`, raw LZ4 blocks with automatic raw fallback |
 | Encryption | External-key XChaCha20-Poly1305, fresh OS nonce per unique object |
 | Placement | `ordered`, seeded `shuffled`; global, payload, section/range scope |
 | Deduplication | Opt-in, exact byte equality within compatible policies |
 | Execution | `memfd`, private, unlinked `file`, both replace the process |
 | Selection | Configurable environment name, exact label, configured default |
+
+Use `fatelf pack --xor` or set `xor = true` under `[storage]` to XOR-mask
+every payload body with the fixed public byte `0xA5`. This requires an updated
+launcher. XOR itself needs no key and provides no confidentiality or authentication.
+The option defaults to false and can be combined with compression or encryption.
 
 Compression/encryption/shuffle inherit global → payload → region settings.
 `storage.encryption` supplies an optional default key ID; `encryption = "none"`

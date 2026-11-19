@@ -642,7 +642,7 @@ fn encrypted_second_payload_is_selective_and_key_environment_is_private() {
             "payloads":[{"name":"a","path":fixtures().a,"shuffle":false},
                 {"name":"b","path":fixtures().b,"shuffle":true,"encryption":"ps","compression":"lz4"}],
             "keys":[{"name":"ps","key_file":key,"env":"PS_KEY_FILE"}],
-            "storage":{"order":"shuffled","manifest_position":position,"dedup":true,"seed":42},
+            "storage":{"order":"shuffled","manifest_position":position,"dedup":true,"seed":42,"xor":position == "front"},
             "execution":{"backend":backend}
         });
         let path = directory.path().join("bundle.toml");
@@ -812,4 +812,93 @@ fn only_payload_headers_are_masked_and_only_selected_payload_is_shuffled() {
         inspect(&binary)["logical_bytes"].as_u64(),
         Some((a.len() + b.len()) as u64)
     );
+}
+
+#[test]
+fn payload_xor_masks_stored_bytes_and_round_trips_without_a_key() {
+    let directory = tempdir().unwrap();
+    let binary = directory.path().join("xor");
+    success(&pack(&binary, &["--xor"], false));
+    let (bytes, _, _, manifest) = metadata(&binary);
+    let pool = fs::metadata(env!("CARGO_BIN_EXE_fatelf-launcher"))
+        .unwrap()
+        .len() as usize;
+    let original = fs::read(&fixtures().a).unwrap();
+    let masked: Vec<_> = original.iter().map(|byte| byte ^ 0xa5).collect();
+    assert_eq!(&bytes[pool..pool + original.len()], masked);
+    assert_eq!(manifest["chunks"][0]["encoding"], "elf-header-xor-a5");
+    assert_eq!(manifest["chunks"][1]["encoding"], "xor-a5");
+    for backend in ["memfd", "file"] {
+        if backend == "file" {
+            let settings = serde_json::json!({
+                "version": 2, "output": binary, "execution": {"backend": "file"},
+                "storage": {"xor": true, "compression": "lz4", "manifest_position": "front"},
+                "payloads": [{"name": "a", "path": fixtures().a}],
+            });
+            let config = directory.path().join("xor.toml");
+            fs::remove_file(&binary).unwrap();
+            fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
+            success(&tool(&[
+                "build".into(),
+                "--config".into(),
+                config.into_os_string(),
+            ]));
+            let (_, _, _, manifest) = metadata(&binary);
+            assert_eq!(manifest["chunks"][1]["encoding"], "xor-a5");
+        }
+        success(
+            &Command::new(&binary)
+                .args(["exit", "0"])
+                .env_remove("FATELF_VARIANT")
+                .output()
+                .unwrap(),
+        );
+        let extracted = directory.path().join(backend);
+        success(&tool(&[
+            "extract".into(),
+            binary.as_os_str().into(),
+            "--variant".into(),
+            "a".into(),
+            "-o".into(),
+            extracted.as_os_str().into(),
+        ]));
+        assert_eq!(fs::read(extracted).unwrap(), original);
+    }
+}
+
+#[test]
+fn launcher_without_payload_xor_marker_can_only_pack_without_xor() {
+    let directory = tempdir().unwrap();
+    let launcher = directory.path().join("launcher");
+    let bundle = directory.path().join("bundle");
+    let mut bytes = fs::read(env!("CARGO_BIN_EXE_fatelf-launcher")).unwrap();
+    let elf = object::File::parse(bytes.as_slice()).unwrap();
+    let names = elf.section_by_name(".shstrtab").unwrap();
+    let name = b".fatelf.xor\0";
+    let index = names
+        .data()
+        .unwrap()
+        .windows(name.len())
+        .position(|window| window == name)
+        .unwrap();
+    let (offset, _) = names.file_range().unwrap();
+    bytes[offset as usize + index + 8] = b'a';
+    fs::write(&launcher, bytes).unwrap();
+    let mut args = vec![
+        "pack".into(),
+        format!("a={}", fixtures().a.display()).into(),
+        "--launcher".into(),
+        launcher.into_os_string(),
+        "-o".into(),
+        bundle.as_os_str().into(),
+    ];
+    args.push("--xor".into());
+    let output = tool(&args);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("launcher does not support payload XOR")
+    );
+    assert!(!bundle.exists());
+    args.pop();
+    success(&tool(&args));
 }

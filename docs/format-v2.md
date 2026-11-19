@@ -43,13 +43,13 @@ Each chunk has pool-relative `offset`, stored `length`, `decoded_length`, actual
 `codec` (`raw`/`lz4-block`), `encoding`, and optional encryption key ID/48-character
 nonce. Each payload has name, original length, `header_length`, BLAKE3 hex hash,
 and ordered chunk indices. Its first reference is exactly one masked 52/64-byte
-ELF header; remaining references use body identity encoding. Noncanonical header
+ELF header; remaining references use `identity` or the optional `xor-a5` body encoding. Noncanonical header
 extensions are rejected. `inspect` reports placement and object statistics.
 
-Encoding is header XOR `0xA5`, then optional compression, then optional AEAD.
-Raw fallback retains the masked header. Decode authenticates first, decompresses
-into an exact bounded buffer, reverses header masking, validates the header,
-and verifies the original digest before execution/publication. AEAD associated
+Both XOR encodings apply the public byte mask `0xA5` before optional compression
+and AEAD. Raw fallback retains the source encoding. Decode authenticates first,
+decompresses into an exact bounded buffer, reverses the source encoding, validates
+the header, and verifies the original digest before execution/publication. AEAD associated
 data is exactly 57 bytes: the 17-byte ASCII domain `fatelf-v2-object\0`
 (including the terminating NUL), the 32 manifest-hash bytes from the footer,
 and the zero-based index in `manifest.chunks` as a little-endian u64.
@@ -57,6 +57,12 @@ The stored object is XChaCha20-Poly1305 ciphertext followed by its 16-byte
 authentication tag. The recorded object length includes the tag.
 Nonces/lengths/offsets are finalized before encryption; ciphertext tags are not
 manifest fields, avoiding a circular commitment.
+
+Payload XOR is an opt-in v2 encoding extension. Builders require an ELF
+`.fatelf.xor` section containing exactly the eight ASCII bytes `FATXOR01` when
+writing `xor-a5` objects. This separate marker preserves the original
+`.fatelf` descriptor. Older readers reject XOR bundles. New readers also
+accept earlier v2 bundles.
 
 **Version break:** TOML schema and container format are independently version 2.
 v1 configs/readers are unsupported; existing standalone v1 executables retain
