@@ -1,7 +1,7 @@
 # Fatelf release procedure
 
 Run `just release-check` in a fresh source checkout with the prerequisites
-in the [README](../../README.md#build-from-source). Before cutting a release,
+in the [development guide](../development.md#build-from-source). Before cutting a release,
 refresh the advisory cache with `cargo deny fetch db`. The gate must pass
 with the lockfiles that will ship.
 
@@ -48,14 +48,15 @@ Keep the package, checksum, and signature together.
 
 ## Verify before extraction
 
-Obtain the release keyring through the project's authenticated channel. From
-a private directory with the three release files, verify the signature and checksum
-before unpacking or running anything.
+Obtain the release keyring through the project's authenticated channel. Keep
+the three downloaded release files in a private directory. From the source
+checkout, verify the signature and checksum before unpacking the archive.
 
 ```sh
-archive=/path/to/fatelf-VERSION-x86_64-unknown-linux-musl.tar.gz
+downloads=/path/to/private-download-directory
+archive="$downloads/fatelf-VERSION-x86_64-unknown-linux-musl.tar.gz"
 bash docs/release/verify-package /absolute/path/fatelf-release.gpg "$archive" &&
-    tar -xzf "$archive"
+    tar -xzf "$archive" -C "$downloads"
 ```
 
 Run `just release-distribution-check` on the release runner to exercise this

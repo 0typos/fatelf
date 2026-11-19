@@ -118,35 +118,13 @@ Other literal matches fall inside launcher code/constants. This is sample eviden
 not a promise that arbitrary programs or random ciphertext contain no accidental
 magic. Public XOR, readable `FATELF02` and JSON metadata make the format identifiable.
 
-## Try the built artifacts
+## Reproduce the walkthroughs
 
-From this checkout, these outputs and their TOML files remain under
-`target/ls-ps-v2/` (ignored by Git). The key file is private mode 0600.
-
-```sh
-# Raw ls body; only ps shuffled. Neither variant needs a key.
-FATELF_APP=ls ./target/ls-ps-v2/raw-end -1 ./target/ls-ps-v2/samples
-FATELF_APP=ps ./target/ls-ps-v2/raw-end -p 1 -o pid,comm
-
-# Only ps is compressed/encrypted. ls still works without a key.
-FATELF_APP=ls ./target/ls-ps-v2/ps-encrypted-front -1 ./target/ls-ps-v2/samples
-env -u PS_KEY_FILE FATELF_APP=ps ./target/ls-ps-v2/ps-encrypted-front -p 1 -o pid,comm
-# Previous command intentionally exits 1:
-# fatelf: required key file environment PS_KEY_FILE is missing
-PS_KEY_FILE="$PWD/target/ls-ps-v2/ps.key" FATELF_APP=ps \
-  ./target/ls-ps-v2/ps-encrypted-front -p 1 -o pid,comm
-```
-
-The ls commands print `alpha.txt`, `beta.txt`, `gamma.txt`. The ps commands print
-PID/COMMAND for PID 1 (`systemd` on this host). The same combined path selects either
-program. Configs can be inspected/edited in the TUI; rebuilding requires changing
-the output path because existing binaries are never overwritten. `measurements.json`
-contains object counts, source-header offsets/prefixes and the exact accounting.
-
-[Guide](tutorial.md) · [memfd cast](tutorial/demos/01-ls-ps-memfd.cast) ·
-[encrypted ps/file cast](tutorial/demos/02-ls-ps-toml-file.cast). Both were refreshed
-using the static release tooling; the file example shows the no-key denial and
-successful unlock, native-output comparisons, and exact extraction.
+The measurement artifacts and keys lived under ignored `target/` directories.
+A fresh checkout includes the recordings and the scripts to build equivalent
+examples. Start with the [walkthrough](tutorial.md), or run the
+[recording script](tutorial/demos/README.md) for either backend. Sizes, process
+names, and timings depend on the host inputs and toolchain.
 
 ## Strengths and weaknesses
 
@@ -198,7 +176,7 @@ Those remain explicit later work rather than implied capabilities of these build
 The current x86_64 recipes use `opt-level="s"` and enable `compact-hash`, which
 selects BLAKE3's Rust SIMD intrinsics instead of native assembly/AVX-512. Builder
 defaults retain native hashing. Neither the v2 format nor its digest/AEAD semantics
-changed. The first tables above and `target/ls-ps-v2/` preserve the earlier baseline.
+changed. The first tables above preserve the earlier baseline.
 
 | Shipping launcher | Previous bytes | Current bytes | Saved |
 |---|---:|---:|---:|
@@ -284,29 +262,17 @@ large input shows a measurable **12.2%** launch regression on this AVX-512 host.
 Choose the documented native-hash build for large inputs where that tradeoff is
 unacceptable. Other target recipes do not automatically enable `compact-hash`;
 AArch64's `pure`/NEON size and performance tradeoff has not been measured.
-Raw samples remain in `target/launcher-optimization/startup-experiments.json`.
+Raw samples were recorded in `target/launcher-optimization/startup-experiments.json`
+on the measurement host.
 
-### Current examples and checks
+### Compact-build verification
 
-Current binaries, TOML files, native output, extracted originals and accounting
-are under `target/ls-ps-compact/`; matching launcher profiles are under
-`target/launchers-compact/x86_64-unknown-linux-musl/`. Its private `ps.key` is a
-new key for these outputs, independent of the older examples.
-
-```sh
-FATELF_APP=ls ./target/ls-ps-compact/lz4-end -1 ./target/ls-ps-compact/samples
-FATELF_APP=ps ./target/ls-ps-compact/lz4-end -p 1 -o pid,comm
-PS_KEY_FILE="$PWD/target/ls-ps-compact/ps.key" FATELF_APP=ps \
-  ./target/ls-ps-compact/ps-encrypted-front -p 1 -o pid,comm
-```
-
-All eight current binaries were rebuilt and run against native ls/ps stdout,
+All eight compact bundles were rebuilt and run against native ls/ps stdout,
 then both originals were extracted and compared byte-for-byte. Each actual file
 size equals its plan. Keyless ls and missing-key ps behavior, both execution
 backends, front/end placement and masked source headers were checked; the independent
-scanner again found a plausible complete ELF header only at offset 0. Symbol
-offsets changed with the launcher, so use the new `measurements.json` for raw magic
-positions. The earlier recordings remain valid for the unchanged commands/format.
+scanner again found a plausible complete ELF header only at offset 0. The launcher optimization changed symbol offsets. Raw magic positions were
+recorded in the local measurements. The earlier recordings remain valid for the unchanged commands/format.
 For this pass, `just ci` passed all 44 tests plus format/clippy/cargo-deny;
 minimal compact core/compression/encryption clippy and `just release` also exited 0.
 RustSec was refreshed before release. Fuzz targets were not rerun because this
