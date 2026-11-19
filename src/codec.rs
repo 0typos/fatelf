@@ -399,11 +399,16 @@ mod tests {
             let json = serde_json::json!({"key": "ps", "nonce": nonce});
             assert!(serde_json::from_value::<Encryption>(json).is_err());
         }
+        let error = match serde_json::from_value::<Encryption>(
+            serde_json::json!({"key": "ps", "nonce": vec![0; 24]}),
+        ) {
+            Ok(_) => panic!("an array must not be accepted as a nonce"),
+            Err(error) => error,
+        };
         assert!(
-            serde_json::from_value::<Encryption>(
-                serde_json::json!({"key": "ps", "nonce": vec![0; 24]})
-            )
-            .is_err()
+            error
+                .to_string()
+                .contains("exactly 48 lowercase hexadecimal nonce characters")
         );
     }
 
@@ -511,6 +516,18 @@ mod tests {
         assert!(decode(stored, 8192, codec, Encoding::Identity).is_err());
     }
 
+    #[cfg(feature = "compression")]
+    #[test]
+    fn a_one_mib_object_can_be_compressed_and_decoded() {
+        let original = vec![7; 1_048_576];
+        let (stored, codec) = prepare(&original, Compression::Lz4, Encoding::Identity).unwrap();
+        assert_eq!(codec, StoredCodec::Lz4Block);
+        assert_eq!(
+            decode(stored, original.len(), codec, Encoding::Identity).unwrap(),
+            original
+        );
+    }
+
     #[cfg(not(feature = "compression"))]
     #[test]
     fn unavailable_compression_fails_explicitly() {
@@ -587,6 +604,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn authenticated_object_length_must_still_be_within_the_format_bounds() {
+        let key = [0; 32];
+        let nonce = [0; 24];
+        let mut aad = [0; 57];
+        aad[..17].copy_from_slice(b"fatelf-v2-object\0");
+        let cipher = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+        for (length, valid) in [(0, false), (1_048_576, true), (1_048_577, false)] {
+            let mut ciphertext = vec![7; length];
+            cipher
+                .encrypt_in_place(&XNonce::from(nonce), &aad, &mut ciphertext)
+                .unwrap();
+            let result = decrypt(&mut ciphertext, &key, &nonce, &[0; 32], 0);
+            assert_eq!(
+                result.is_ok(),
+                valid,
+                "authenticated plaintext length {length}"
+            );
+            if valid {
+                assert_eq!(ciphertext, vec![7; length]);
+            }
+        }
     }
 
     #[cfg(not(feature = "encryption"))]
