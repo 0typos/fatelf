@@ -992,4 +992,350 @@ mod tests {
         assert!(finish_output(output, &path).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"another writer");
     }
+
+    #[test]
+    fn input_specs_and_ranges_preserve_paths_and_exact_boundaries() {
+        let input: Input = "a=path=with=equals".parse().unwrap();
+        assert_eq!(input.name, "a");
+        assert_eq!(input.path, Path::new("path=with=equals"));
+        for bad in ["missing-separator", "a=", "bad name=path"] {
+            assert!(bad.parse::<Input>().is_err(), "{bad:?}");
+        }
+
+        let range: ByteRange = "0x100:257".parse().unwrap();
+        assert_eq!(range.0, 256..257);
+        for bad in ["0", "0x:1", "256:256", "257:256", "1:2:3"] {
+            assert!(bad.parse::<ByteRange>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_manifest_accepts_the_limit_without_partial_overflow() {
+        let limit = 96 * 1024;
+        let first = vec![1; 64 * 1024];
+        let remaining = vec![2; limit - first.len()];
+        let mut manifest = BoundedManifest::new(limit);
+        manifest.write_all(&first).unwrap();
+        assert!(manifest.bytes.capacity() < limit);
+        manifest.write_all(&remaining).unwrap();
+        assert!(manifest.bytes.capacity() <= limit);
+        manifest.flush().unwrap();
+
+        assert_eq!(manifest.write(&[]).unwrap(), 0);
+        let error = manifest.write(&[3]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(manifest.bytes.len(), limit);
+        assert_eq!(&manifest.bytes[..first.len()], first);
+        assert_eq!(&manifest.bytes[first.len()..], remaining);
+    }
+
+    fn pack_options() -> PackOptions {
+        crate::config::BuildConfig::parse(
+            "version = 2\noutput = 'combined'\n[[payloads]]\nname = 'a'\npath = 'one'\n",
+        )
+        .unwrap()
+        .options(Path::new("."))
+        .unwrap()
+    }
+
+    #[test]
+    fn pack_validation_enforces_independent_options_and_exact_limits() {
+        let mut options = pack_options();
+        options.chunk_size = 256;
+        options.budgets.max_payloads = 1;
+        options.budgets.max_object_bytes = 256;
+        options.validate().unwrap();
+        for size in [255, 257] {
+            options.chunk_size = size;
+            assert!(options.validate().is_err(), "accepted chunk size {size}");
+        }
+        options.budgets.max_object_bytes = MAX_CHUNK;
+        options.chunk_size = MAX_CHUNK as u32;
+        options.validate().unwrap();
+        options.chunk_size += 1;
+        assert!(options.validate().is_err());
+
+        type Change = fn(&mut PackOptions);
+        let invalid: &[(&str, Change)] = &[
+            ("empty inputs", |o| o.inputs.clear()),
+            ("exceeded payload count", |o| {
+                o.budgets.max_payloads = 1;
+                o.inputs.push(Input::new("b".into(), "two".into()));
+            }),
+            ("sections require shuffled order", |o| {
+                o.section.push(".text".into())
+            }),
+            ("ranges require shuffled order", |o| {
+                o.ranges.push(ByteRange(256..512))
+            }),
+            ("payload scope requires shuffled order", |o| {
+                o.shuffle_payloads.push("a".into())
+            }),
+            ("scopes must be mutually exclusive", |o| {
+                o.order = Order::Shuffled;
+                o.section.push(".text".into());
+                o.ranges.push(ByteRange(256..512));
+            }),
+            ("empty output", |o| o.output.clear()),
+            ("empty launcher", |o| o.launcher = Some(PathBuf::new())),
+            ("empty payload path", |o| o.inputs[0].path.clear()),
+            ("explicit payload shuffle requires shuffled order", |o| {
+                o.inputs[0].shuffle = Some(true)
+            }),
+            ("unknown shuffle payload", |o| {
+                o.order = Order::Shuffled;
+                o.shuffle_payloads.push("missing".into());
+            }),
+            ("missing default payload", |o| {
+                o.default = Some("missing".into())
+            }),
+            ("missing global key", |o| {
+                o.encryption = Some("missing".into())
+            }),
+        ];
+        for (description, change) in invalid {
+            let mut options = pack_options();
+            change(&mut options);
+            assert!(options.validate().is_err(), "{description}");
+        }
+    }
+
+    #[test]
+    fn list_limits_and_region_selectors_are_validated_before_packing() {
+        let mut options = pack_options();
+        options.order = Order::Shuffled;
+        options.section = vec![".text".into(); 1024];
+        options.validate().unwrap();
+        options.section.push(".data".into());
+        assert!(options.validate().is_err());
+        options.section.clear();
+        options.ranges = vec![ByteRange(256..512); 1024];
+        options.validate().unwrap();
+        options.ranges.push(ByteRange(512..768));
+        assert!(options.validate().is_err());
+        options.ranges.clear();
+        let range = Region {
+            section: None,
+            range: Some("256:512".into()),
+            compression: None,
+            shuffle: Some(true),
+            encryption: None,
+        };
+        options.inputs[0].regions = vec![range.clone(); 1024];
+        options.validate().unwrap();
+        options.inputs[0].regions.push(range.clone());
+        assert!(options.validate().is_err());
+        options.order = Order::Ordered;
+        options.inputs[0].regions = vec![range];
+        assert!(
+            options.validate().is_err(),
+            "region shuffle requires shuffled order"
+        );
+        let region = &mut options.inputs[0].regions[0];
+        region.shuffle = None;
+        region.section = Some(".text".into());
+        assert!(
+            options.validate().is_err(),
+            "each rule must define exactly one selector"
+        );
+        let region = &mut options.inputs[0].regions[0];
+        region.range = None;
+        region.section = Some(String::new());
+        assert!(
+            options.validate().is_err(),
+            "an empty section is not a selector"
+        );
+    }
+
+    #[test]
+    fn key_validation_accepts_exactly_64_references_and_reserves_none() {
+        let mut options = pack_options();
+        options.keys = (0..64)
+            .map(|index| KeyConfig {
+                name: format!("key{index}"),
+                key_file: "unused".into(),
+                env: format!("UNLOCK_{index}"),
+            })
+            .collect();
+        options.encryption = Some("key0".into());
+        options.validate().unwrap();
+        options.keys.push(KeyConfig {
+            name: "extra".into(),
+            key_file: "unused".into(),
+            env: "EXTRA_UNLOCK".into(),
+        });
+        assert!(options.validate().is_err());
+        options.keys.pop();
+
+        options.keys[1].name = options.keys[0].name.clone();
+        assert!(options.validate().is_err());
+        options.keys[1].name = "key1".into();
+        options.keys[1].env = options.keys[0].env.clone();
+        assert!(options.validate().is_err());
+        options.keys[1].env = "UNLOCK_1".into();
+
+        options.keys[0].name = "none".into();
+        options.encryption = None;
+        assert!(options.validate().is_err());
+        options.keys.remove(0);
+        options.encryption = Some("none".into());
+        options.validate().unwrap();
+    }
+
+    #[test]
+    fn scope_ranges_merge_and_keep_the_complete_elf_header_intact() {
+        for range in [0..64, 0..65, 64..65, 65..66] {
+            assert!(
+                PackOptions::check_header_boundary(&range, 64).is_ok(),
+                "{range:?}"
+            );
+        }
+        for range in [0..63, 1..64, 63..65] {
+            assert!(
+                PackOptions::check_header_boundary(&range, 64).is_err(),
+                "{range:?}"
+            );
+        }
+        let elf = Elf {
+            bytes: vec![0; 192],
+            architecture: object::Architecture::X86_64,
+            little_endian: true,
+        };
+        let mut options = pack_options();
+        options.order = Order::Shuffled;
+        options.ranges = [64..128, 160..192, 80..96, 128..144]
+            .into_iter()
+            .map(ByteRange)
+            .collect();
+        assert_eq!(options.selected_ranges(&elf).unwrap(), [64..144, 160..192]);
+        options.ranges.push(ByteRange(192..193));
+        assert!(options.selected_ranges(&elf).is_err());
+    }
+
+    #[test]
+    fn resolved_policies_preserve_header_and_merge_adjacent_equal_regions() {
+        let elf = Elf {
+            bytes: vec![0; 192],
+            architecture: object::Architecture::X86_64,
+            little_endian: true,
+        };
+        let options = pack_options();
+        let mut input = options.inputs[0].clone();
+        input.regions = [
+            ("64:80", Compression::None),
+            ("80:96", Compression::None),
+            ("96:160", Compression::Lz4),
+            ("160:192", Compression::None),
+        ]
+        .into_iter()
+        .map(|(range, compression)| Region {
+            section: None,
+            range: Some(range.into()),
+            compression: Some(compression),
+            shuffle: None,
+            encryption: None,
+        })
+        .collect();
+        let rules = options
+            .policies(&input, &elf, 64)
+            .unwrap()
+            .into_iter()
+            .map(|(range, policy)| (range, policy.compression))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rules,
+            [
+                (0..64, Compression::None),
+                (64..96, Compression::None),
+                (96..160, Compression::Lz4),
+                (160..192, Compression::None),
+            ]
+        );
+        input.regions[3].range = Some("160:193".into());
+        assert!(options.policies(&input, &elf, 64).is_err());
+    }
+
+    #[test]
+    fn spool_enforces_object_and_disk_budgets_at_the_boundary() {
+        let mut pool = Pool::new(Budgets {
+            max_object_bytes: 4,
+            max_objects: 3,
+            max_spool_bytes: 5,
+            ..Budgets::default()
+        })
+        .unwrap();
+        let policy = Policy {
+            compression: Compression::None,
+            shuffle: false,
+            encryption: None,
+        };
+        for bytes in [&[][..], &[0; 5]] {
+            assert!(
+                pool.insert(bytes, Encoding::Identity, &policy, true)
+                    .is_err()
+            );
+        }
+        let full = pool
+            .insert(b"abcd", Encoding::Identity, &policy, true)
+            .unwrap();
+        assert_eq!(
+            pool.insert(b"abcd", Encoding::Identity, &policy, true)
+                .unwrap(),
+            full
+        );
+        pool.insert(b"e", Encoding::Identity, &policy, true)
+            .unwrap();
+        let error = pool
+            .insert(b"f", Encoding::Identity, &policy, true)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "encoded spool exceeds configured budget");
+    }
+
+    #[test]
+    fn seeded_layout_shuffles_runs_independently_between_anchors() {
+        let mut pool = Pool::new(Budgets::default()).unwrap();
+        for (index, shuffle) in [true, false, true, true, true, true, false, true, true]
+            .into_iter()
+            .enumerate()
+        {
+            let policy = Policy {
+                compression: Compression::None,
+                shuffle,
+                encryption: None,
+            };
+            pool.insert(&[index as u8], Encoding::Identity, &policy, false)
+                .unwrap();
+        }
+        let (chunks, length) = pool.layout(Order::Shuffled, 0).unwrap();
+        assert_eq!(length, 9);
+        let offsets = chunks.iter().map(|chunk| chunk.offset).collect::<Vec<_>>();
+        // At seed zero the length-four run swaps its first and third objects.
+        assert_eq!(offsets, [0, 1, 4, 3, 2, 5, 6, 8, 7]);
+    }
+
+    #[test]
+    fn splitmix_reference_sequence_is_stable() {
+        let mut rng = Shuffle(0);
+        assert_eq!(rng.next(), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(rng.next(), 0x6e78_9e6a_a1b9_65f4);
+        assert_eq!(rng.next(), 0x06c4_5d18_8009_454f);
+    }
+
+    #[test]
+    fn output_resolution_checks_the_destination_without_creating_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("out");
+        assert_eq!(output_parent(&output).unwrap(), directory.path());
+        assert!(!output.exists());
+        fs::write(&output, b"keep").unwrap();
+        assert!(output_parent(&output).is_err());
+        assert!(output_parent(&output.join("child")).is_err());
+
+        let relative = PathBuf::from(directory.path().file_name().unwrap());
+        directory.close().unwrap();
+        assert_eq!(output_parent(&relative).unwrap(), Path::new("."));
+        for invalid in ["", ".", "..", "missing/"] {
+            assert!(output_parent(Path::new(invalid)).is_err(), "{invalid:?}");
+        }
+    }
 }
