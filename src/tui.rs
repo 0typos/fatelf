@@ -359,7 +359,7 @@ impl Field {
                 "front stores the manifest immediately after the launcher; end stores it after the pool. A fixed locator footer stays at EOF in both layouts."
             }
             Self::Compression => {
-                "none stores encoded bytes directly. lz4 compresses each object only if smaller, then falls back to raw encoded storage. Per-payload and region overrides are preserved."
+                "none stores encoded bytes directly. lz4 and zstd retain compressed objects only when smaller. Per-payload and region overrides are preserved."
             }
             Self::PayloadShuffle(_) => {
                 "inherit follows global order and scope. true enables this payload; false anchors its objects. Enabling shuffle requires shuffled order. Region overrides are preserved."
@@ -1194,7 +1194,10 @@ mod tests {
     fn form_exposes_supported_choices_and_clears_optional_settings() {
         assert_eq!(Field::Order.choices(), ["ordered", "shuffled"]);
         assert_eq!(Field::ManifestPosition.choices(), ["front", "end"]);
-        assert_eq!(Field::Compression.choices(), ["none", "lz4"]);
+        assert_eq!(
+            Field::Compression.choices(),
+            ["none", "lz4", "zstd", "zstd-delta"]
+        );
         assert_eq!(
             Field::PayloadShuffle(0).choices(),
             ["inherit", "false", "true"]

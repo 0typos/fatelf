@@ -98,12 +98,33 @@ in this release; inherited key descriptors/providers and secret delivery are lat
 | Layout | `overlay`, with `front` or `end` manifest placement |
 | Chunking | Fixed size, 256 bytes–1 MiB; default 4096 |
 | Source encoding | Mandatory full-header `elf-header-xor-a5`; body `identity`, `xor-a5`, or `xor-mask` |
-| Compression | `none`, raw LZ4 blocks with automatic raw fallback |
+| Compression | `none`, `lz4`, `zstd`, `zstd-delta`, with automatic raw fallback |
 | Encryption | External-key XChaCha20-Poly1305, fresh OS nonce per unique object |
 | Placement | `ordered`, seeded `shuffled`; global, payload, section/range scope |
 | Deduplication | Opt-in, exact byte equality within compatible policies |
 | Execution | `memfd`, private, unlinked `file`, both replace the process |
 | Selection | Configurable environment name, exact label, configured default |
+
+Choose `lz4` for a small launcher or short packing runs. Try `zstd` for
+independent compression, or `zstd-delta` for related executables. These
+choices also work with `pack --compression`.
+
+```toml
+[storage]
+compression = "zstd-delta"
+chunk_size = 1048576
+dedup = true
+```
+
+List the base executable first. Each later payload can reference one
+corresponding base chunk when it saves space. Chunks without a suitable base
+use independent Zstandard or raw storage. Base chunks used as references
+must be unencrypted. Targets may still be encrypted. The default payload and
+execution backend are independent of compression. Both `memfd` and `file`
+verify the reconstructed bytes before launch. Compare the complete
+`output_bytes` from `fatelf plan`, since decoder and metadata size count.
+XOR encoding can reduce delta savings because the Zstandard prefix uses the
+base chunk's original bytes.
 
 Use `fatelf pack --xor` or set `xor = true` under `[storage]` to XOR-mask
 every payload body with the fixed public byte `0xA5`. This requires an updated
@@ -172,8 +193,10 @@ hard bounds.
 
 Packing reads one bounded original ELF at a time and spools encoded unique objects
 once; it retains no parallel raw spool. Encrypted storage adds 16 bytes per object
-and counts toward stored budgets. Reconstruction holds at most one stored object
-(1 MiB + tag) and one decoded object (1 MiB). Compression output scratch is capped
+and counts toward stored budgets. Reconstruction buffers hold one stored object
+(1 MiB + tag) and one decoded object (1 MiB), plus at most one stored and
+one decoded base object for a delta. The codec also allocates its working
+context. Compression output scratch is capped
 at 2 MiB beyond the source buffer. Manifest writes are bounded before growth;
 parsers enforce hard size caps before applying lower manifest/config budgets.
 Launcher input has a separate 1 GiB ceiling. Temporary output length is bounded

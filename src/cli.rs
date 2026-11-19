@@ -172,6 +172,8 @@ pub(crate) fn run() -> Result<(), Error> {
                 "pool_offset": container.pool_start,
                 "encrypted_objects": manifest.chunks.iter().filter(|chunk| chunk.encryption.is_some()).count(),
                 "lz4_objects": manifest.chunks.iter().filter(|chunk| chunk.codec == StoredCodec::Lz4Block).count(),
+                "zstd_objects": manifest.chunks.iter().filter(|chunk| chunk.codec.uses_zstd()).count(),
+                "delta_objects": manifest.chunks.iter().filter(|chunk| matches!(chunk.codec, StoredCodec::ZstdDelta { .. })).count(),
                 "logical_bytes": logical_bytes,
                 "stored_bytes": container.pool_length,
                 "unique_chunks": manifest.chunks.len(),

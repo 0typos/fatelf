@@ -48,7 +48,9 @@ pub fn fuzz_container(bytes: &[u8]) {
     // Exercise codec input directly even when container mutations fail metadata validation.
     if let Some(prefix) = bytes.get(..3) {
         let decoded_length = usize::from(u16::from_le_bytes([prefix[1], prefix[2]])) + 1;
-        let codec = if prefix[0] & 1 == 0 {
+        let codec = if prefix[0] & 16 != 0 {
+            codec::StoredCodec::ZstdFrame
+        } else if prefix[0] & 1 == 0 {
             codec::StoredCodec::Raw
         } else {
             codec::StoredCodec::Lz4Block
@@ -63,6 +65,7 @@ pub fn fuzz_container(bytes: &[u8]) {
             codec::Encoding::ElfHeaderXorA5
         };
         let _ = codec::decode(bytes[3..].to_vec(), decoded_length, codec, encoding, prefix);
+        let _ = codec::decode_delta(&bytes[3..], decoded_length, prefix, encoding, prefix);
         #[cfg(feature = "encryption")]
         let _ = codec::decrypt(&mut bytes[3..].to_vec(), &[0; 32], &[0; 24], &[0; 32], 0);
     }

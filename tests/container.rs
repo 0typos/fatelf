@@ -105,6 +105,87 @@ fn inspect(path: &Path) -> Value {
 }
 
 #[test]
+fn zstandard_modes_round_trip_both_executables_and_share_related_blocks() {
+    let directory = tempdir().unwrap();
+    let mut sizes = Vec::new();
+    let duplicate = format!("duplicate={}", fixtures().b.display());
+    for (compression, backend) in [("zstd", "memfd"), ("zstd-delta", "file")] {
+        let binary = directory.path().join(compression);
+        success(&pack(
+            &binary,
+            &[
+                "--compression",
+                compression,
+                "--chunk-size",
+                "65536",
+                "--exec",
+                backend,
+                "--dedup",
+                &duplicate,
+            ],
+            false,
+        ));
+        let report = inspect(&binary);
+        assert!(report["zstd_objects"].as_u64().unwrap() > 0);
+        assert_eq!(
+            report["delta_objects"].as_u64().unwrap() > 0,
+            compression == "zstd-delta"
+        );
+        success(&tool(&["verify".into(), binary.as_os_str().into()]));
+        for (variant, source) in [("a", &fixtures().a), ("b", &fixtures().b)] {
+            let output = directory.path().join(format!("{compression}-{variant}"));
+            success(&tool(&[
+                "extract".into(),
+                binary.as_os_str().into(),
+                "--variant".into(),
+                variant.into(),
+                "-o".into(),
+                output.as_os_str().into(),
+            ]));
+            assert_eq!(fs::read(output).unwrap(), fs::read(source).unwrap());
+            let launched = Command::new(&binary)
+                .args(["exit", "37"])
+                .env("FATELF_VARIANT", variant)
+                .output()
+                .unwrap();
+            assert_eq!(launched.status.code(), Some(37));
+        }
+        sizes.push(fs::metadata(binary).unwrap().len());
+        if compression == "zstd-delta" {
+            let binary = directory.path().join(compression);
+            let (mut bytes, start, _, mut manifest) = metadata(&binary);
+            assert_eq!(
+                manifest["payloads"][1]["chunks"],
+                manifest["payloads"][2]["chunks"]
+            );
+            let chunks = manifest["chunks"].as_array_mut().unwrap();
+            let (id, chunk) = chunks
+                .iter_mut()
+                .enumerate()
+                .find(|(_, chunk)| chunk["codec"]["zstd-delta"].is_object())
+                .unwrap();
+            chunk["codec"]["zstd-delta"]["base"] = id.into();
+            let manifest = serde_json::to_vec(&manifest).unwrap();
+            let mut footer = bytes.split_off(bytes.len() - 64);
+            footer[24..32].copy_from_slice(&(manifest.len() as u64).to_le_bytes());
+            footer[32..].copy_from_slice(blake3::hash(&manifest).as_bytes());
+            bytes.truncate(start);
+            bytes.extend(manifest);
+            bytes.extend(footer);
+            let corrupt = directory.path().join("cyclic-delta");
+            fs::write(&corrupt, bytes).unwrap();
+            let rejected = tool(&["verify".into(), corrupt.into_os_string()]);
+            assert!(!rejected.status.success());
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr)
+                    .contains("invalid Zstandard delta base object")
+            );
+        }
+    }
+    assert!(sizes[1] < sizes[0]);
+}
+
+#[test]
 fn selection_preserves_raw_arguments_environment_and_exit_status() {
     for backend in ["memfd", "file"] {
         let directory = tempdir().unwrap();

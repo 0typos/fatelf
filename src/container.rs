@@ -226,7 +226,7 @@ impl Manifest {
         }
         let mut uses_mask = false;
         let mut intervals = Vec::with_capacity(self.chunks.len());
-        for chunk in &self.chunks {
+        for (id, chunk) in self.chunks.iter().enumerate() {
             uses_mask |= chunk.encoding == Encoding::XorMask;
             let tag = if let Some(encryption) = &chunk.encryption {
                 if !key_names.contains(&encryption.key) {
@@ -253,16 +253,27 @@ impl Manifest {
                 StoredCodec::Raw if inner_length != Some(chunk.decoded_length) => {
                     return Err(Error::Invalid("raw object length mismatch".into()));
                 }
-                StoredCodec::Lz4Block
+                StoredCodec::Lz4Block | StoredCodec::ZstdFrame | StoredCodec::ZstdDelta { .. }
                     if inner_length.is_none_or(|length| length >= chunk.decoded_length) =>
                 {
                     return Err(Error::Invalid(
-                        "LZ4 object must be smaller than decoded bytes".into(),
+                        "compressed object must be smaller than decoded bytes".into(),
                     ));
                 }
                 _ => (),
             }
+            if let StoredCodec::ZstdDelta { base } = chunk.codec
+                && (base >= id
+                    || self.chunks[base].decoded_length > chunk.decoded_length
+                    || self.chunks[base].encryption.is_some()
+                    || self.chunks[base].encoding == Encoding::ElfHeaderXorA5
+                    || chunk.encoding == Encoding::ElfHeaderXorA5
+                    || matches!(self.chunks[base].codec, StoredCodec::ZstdDelta { .. }))
+            {
+                return Err(Error::Invalid("invalid Zstandard delta base object".into()));
+            }
             if chunk.codec == StoredCodec::Lz4Block && !cfg!(feature = "compression")
+                || chunk.codec.uses_zstd() && !cfg!(feature = "zstandard")
                 || chunk.encryption.is_some() && !cfg!(feature = "encryption")
             {
                 return Err(Error::Invalid(
@@ -348,7 +359,7 @@ impl Manifest {
     }
 }
 
-/// Validated random-access source; buffers are bounded by one encoded/decoded object.
+/// Validated random-access source with bounded object buffers and one-hop deltas.
 pub(crate) struct Container<R> {
     source: R,
     #[cfg(feature = "builder")]
@@ -494,13 +505,38 @@ impl<R: Read + Seek> Container<R> {
                     return Err(Error::Invalid("encryption feature is unavailable".into()));
                 }
             }
-            let decoded = codec::decode(
-                bytes,
-                chunk.decoded_length as usize,
-                chunk.codec,
-                chunk.encoding,
-                self.manifest.xor_mask.as_deref().unwrap_or_default(),
-            )?;
+            let mask = self.manifest.xor_mask.as_deref().unwrap_or_default();
+            let decoded = match chunk.codec {
+                #[cfg(feature = "zstandard")]
+                StoredCodec::ZstdDelta { base } => {
+                    let base = &self.manifest.chunks[base];
+                    self.source
+                        .seek(SeekFrom::Start(self.pool_start + base.offset))?;
+                    let mut stored = vec![0; base.length as usize];
+                    self.source.read_exact(&mut stored)?;
+                    let prefix = codec::decode(
+                        stored,
+                        base.decoded_length as usize,
+                        base.codec,
+                        base.encoding,
+                        mask,
+                    )?;
+                    codec::decode_delta(
+                        &bytes,
+                        chunk.decoded_length as usize,
+                        &prefix,
+                        chunk.encoding,
+                        mask,
+                    )?
+                }
+                _ => codec::decode(
+                    bytes,
+                    chunk.decoded_length as usize,
+                    chunk.codec,
+                    chunk.encoding,
+                    mask,
+                )?,
+            };
             if ordinal == 0 && elf::header_length(&decoded)? as u64 != payload.header_length {
                 return Err(Error::Invalid(
                     "reconstructed ELF header size mismatch".into(),
@@ -1045,7 +1081,7 @@ pub(crate) mod tests {
             (
                 "lz4 size tie",
                 |m| m.chunks[0].codec = StoredCodec::Lz4Block,
-                "LZ4 object must be smaller",
+                "compressed object must be smaller",
             ),
         ] {
             let mut data = manifest(Position::End);

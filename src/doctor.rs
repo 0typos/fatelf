@@ -56,8 +56,8 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool, strict: bool) -> Resul
                         .as_ref()
                         .expect("invariant: launcher read includes codecs");
                     format!(
-                        "{:?}; current launcher revision; compression={}; encryption={}",
-                        elf.architecture, codecs.compression, codecs.encryption
+                        "{:?}; current launcher revision; compression={}; encryption={}; zstandard={}",
+                        elf.architecture, codecs.compression, codecs.encryption, codecs.zstandard
                     )
                 }),
             ));

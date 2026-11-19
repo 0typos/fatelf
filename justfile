@@ -38,7 +38,7 @@ fuzz-config target="x86_64-unknown-linux-gnu":
 # Static, auditable artifacts; unsigned, with no publication side effects.
 release target="x86_64-unknown-linux-musl":
     bash docs/release/zigbuild --locked --release --target {{target}} --bin fatelf
-    just launcher compression,encryption {{target}}
+    just launcher compression,encryption,zstandard {{target}}
     mkdir -p target/{{target}}/release
     cp target/fatelf-distribution/{{target}}/release/fatelf target/{{target}}/release/fatelf
     cp target/{{target}}/launcher/fatelf-launcher target/{{target}}/release/fatelf-launcher
@@ -56,8 +56,8 @@ release-operations:
 release-distribution-check:
     bash tests/release-distribution target/x86_64-unknown-linux-musl/release
 
-# Small runtime only; features may be empty, compression, encryption, or both.
-launcher features="compression,encryption" target="x86_64-unknown-linux-musl":
+# Small runtime only; select the required optional decoders.
+launcher features="compression,encryption,zstandard" target="x86_64-unknown-linux-musl":
     bash docs/release/zigbuild --locked --profile launcher --no-default-features --features '{{features}}{{if target =~ "^x86_64-" { ",compact-hash" } else { "" }}}' --target {{target}} --bin fatelf-launcher
     mkdir -p target/{{target}}/launcher
     cp target/fatelf-distribution/{{target}}/launcher/fatelf-launcher target/{{target}}/launcher/fatelf-launcher

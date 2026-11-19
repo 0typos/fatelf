@@ -106,7 +106,8 @@ program, its libraries, and the selected execution backend.
 
 ## Configure storage and execution
 
-- Use optional LZ4 compression and exact-byte deduplication to reduce stored size.
+- Use LZ4 for fast packing, Zstandard for a smaller bundle, or Zstandard
+  deltas for closely related builds. Each mode can use exact-byte deduplication.
 - Apply external-key encryption to selected payloads or byte ranges. XOR
   masking is reversible and provides no confidentiality. See the
   [security boundaries](docs/operations.md#security-boundaries).

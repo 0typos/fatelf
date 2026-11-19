@@ -1,6 +1,6 @@
 [package]
 name = "fatelf"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -10,9 +10,10 @@ default-run = "fatelf"
 
 [features]
 default = ["builder", "compression", "encryption"]
-builder = ["compression", "encryption", "dep:clap", "dep:color-eyre", "dep:crossterm", "dep:ratatui", "dep:toml", "dep:unicode-width"]
+builder = ["compression", "encryption", "zstandard", "dep:clap", "dep:color-eyre", "dep:crossterm", "dep:ratatui", "dep:toml", "dep:unicode-width"]
 compression = ["dep:lz4_flex"]
 encryption = ["dep:chacha20poly1305", "dep:getrandom", "dep:zeroize"]
+zstandard = ["dep:zstd"]
 # Rust SIMD intrinsics keep x86 launchers smaller than native assembly/AVX-512.
 compact-hash = ["blake3/pure"]
 fuzzing = ["builder"]
@@ -37,6 +38,7 @@ thiserror = "2"
 toml = { version = "1.1", optional = true }
 unicode-width = { version = "0.2", optional = true }
 zeroize = { version = "1.8", optional = true }
+zstd = { version = "=0.13.5", default-features = false, optional = true }
 
 [profile.release]
 lto = "thin"

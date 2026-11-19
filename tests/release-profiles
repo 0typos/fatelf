@@ -9,13 +9,14 @@ unset FATELF_VARIANT
 cp /usr/bin/true "$scratch/payload"
 truncate -s +65536 "$scratch/payload"
 
-for profile in core compression encryption; do
+for profile in core compression encryption zstandard; do
     features=$profile
     if [[ "$profile" == core ]]; then features=; fi
     just launcher "$features"
     launcher="target/x86_64-unknown-linux-musl/launcher/fatelf-launcher"
     flags=()
     if [[ "$profile" == compression ]]; then flags=(--compression lz4); fi
+    if [[ "$profile" == zstandard ]]; then flags=(--compression zstd); fi
     if [[ "$profile" == encryption ]]; then
         cp "$launcher" "$scratch/launcher"
         (umask 077; head -c 32 /dev/urandom > "$scratch/key")

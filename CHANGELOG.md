@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0-beta.2
+
+- Add `zstd` for independent object compression and `zstd-delta` for sharing
+  bytes with a related first payload. Both modes retain raw fallback.
+- Ship a Zstandard-capable launcher and keep the smaller launcher feature
+  profiles available. Existing v2 bundles remain readable.
+- Report Zstandard and delta object counts in `fatelf inspect`.
+
 ## 0.2.0-beta.1
 
 - Package and select Linux ELF payloads in a single executable. The memfd and

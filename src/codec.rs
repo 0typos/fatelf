@@ -25,14 +25,26 @@ pub(crate) enum Compression {
     #[default]
     None,
     Lz4,
+    Zstd,
+    #[serde(rename = "zstd-delta")]
+    ZstdDelta,
 }
 
 /// Actual object decompression recorded after any raw fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) enum StoredCodec {
     Raw,
     Lz4Block,
+    ZstdFrame,
+    ZstdDelta { base: usize },
+}
+
+impl StoredCodec {
+    /// Whether the object needs the Zstandard decoder.
+    pub(crate) fn uses_zstd(self) -> bool {
+        matches!(self, Self::ZstdFrame | Self::ZstdDelta { .. })
+    }
 }
 
 /// Public reversible encoding applied to source bytes before compression.
@@ -149,7 +161,7 @@ pub(crate) fn random_xor_mask(length: usize) -> Result<Vec<u8>, Error> {
     Ok(mask)
 }
 
-/// Encode source bytes and retain LZ4 only when it is strictly smaller.
+/// Encode source bytes and retain compressed output only when it is smaller.
 #[cfg(any(feature = "builder", test))]
 pub(crate) fn prepare(
     bytes: &[u8],
@@ -160,9 +172,30 @@ pub(crate) fn prepare(
     validate_length(bytes.len())?;
     let mut source = bytes.to_vec();
     apply_encoding(&mut source, encoding, xor_mask)?;
-    if compression == Compression::None {
-        return Ok((source, StoredCodec::Raw));
+    let (compressed, codec) = match compression {
+        Compression::None => return Ok((source, StoredCodec::Raw)),
+        Compression::Lz4 => (compress_lz4(&source)?, StoredCodec::Lz4Block),
+        Compression::Zstd | Compression::ZstdDelta => {
+            #[cfg(feature = "zstandard")]
+            {
+                (zstd::bulk::compress(&source, 6)?, StoredCodec::ZstdFrame)
+            }
+            #[cfg(not(feature = "zstandard"))]
+            return Err(Error::Invalid(
+                "this binary does not support Zstandard".into(),
+            ));
+        }
+    };
+    if compressed.len() < source.len() {
+        Ok((compressed, codec))
+    } else {
+        Ok((source, StoredCodec::Raw))
     }
+}
+
+/// Compress one bounded object with the LZ4 block codec.
+#[cfg(any(feature = "builder", test))]
+fn compress_lz4(source: &[u8]) -> Result<Vec<u8>, Error> {
     #[cfg(feature = "compression")]
     {
         let capacity = lz4_flex::block::get_maximum_output_size(source.len());
@@ -172,16 +205,14 @@ pub(crate) fn prepare(
             ));
         }
         let mut compressed = vec![0; capacity];
-        let written = lz4_flex::block::compress_into(&source, &mut compressed)
+        let written = lz4_flex::block::compress_into(source, &mut compressed)
             .map_err(|_| Error::Invalid("LZ4 object compression failed".into()))?;
-        if written < source.len() {
-            compressed.truncate(written);
-            return Ok((compressed, StoredCodec::Lz4Block));
-        }
-        Ok((source, StoredCodec::Raw))
+        compressed.truncate(written);
+        Ok(compressed)
     }
     #[cfg(not(feature = "compression"))]
     {
+        let _ = source;
         Err(Error::Invalid(
             "this binary does not support LZ4 compression".into(),
         ))
@@ -231,9 +262,102 @@ pub(crate) fn decode(
                 ));
             }
         }
+        StoredCodec::ZstdFrame => {
+            if bytes.len() >= decoded_length {
+                return Err(Error::Invalid(
+                    "Zstandard object must be smaller than its decoded bytes".into(),
+                ));
+            }
+            #[cfg(feature = "zstandard")]
+            {
+                bytes = decode_zstd(&bytes, decoded_length, &[])?;
+            }
+            #[cfg(not(feature = "zstandard"))]
+            return Err(Error::Invalid(
+                "this binary does not support Zstandard".into(),
+            ));
+        }
+        StoredCodec::ZstdDelta { .. } => {
+            return Err(Error::Invalid(
+                "Zstandard delta requires a base object".into(),
+            ));
+        }
     }
     apply_encoding(&mut bytes, encoding, xor_mask)?;
     Ok(bytes)
+}
+
+/// Decode one complete frame into a bounded buffer using an optional base object.
+#[cfg(feature = "zstandard")]
+fn decode_zstd(bytes: &[u8], decoded_length: usize, dictionary: &[u8]) -> Result<Vec<u8>, Error> {
+    use zstd::zstd_safe::{DCtx, find_frame_compressed_size, get_frame_content_size};
+
+    if find_frame_compressed_size(bytes) != Ok(bytes.len())
+        || get_frame_content_size(bytes).ok().flatten() != Some(decoded_length as u64)
+    {
+        return Err(Error::Invalid("invalid Zstandard frame boundaries".into()));
+    }
+    let mut decoder = DCtx::default();
+    decoder.ref_prefix(dictionary).map_err(zstd_error)?;
+    let mut output = vec![0; decoded_length];
+    if decoder
+        .decompress(output.as_mut_slice(), bytes)
+        .map_err(zstd_error)?
+        != decoded_length
+    {
+        return Err(Error::Invalid(
+            "Zstandard decoded length does not match manifest".into(),
+        ));
+    }
+    Ok(output)
+}
+
+/// Encode one object using an independent object's original bytes as a raw prefix.
+#[cfg(feature = "builder")]
+pub(crate) fn prepare_delta(
+    bytes: &[u8],
+    base: &[u8],
+    encoding: Encoding,
+    mask: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use zstd::zstd_safe::{CCtx, CParameter, compress_bound};
+
+    let mut source = bytes.to_vec();
+    apply_encoding(&mut source, encoding, mask)?;
+    let mut compressor = CCtx::default();
+    compressor
+        .set_parameter(CParameter::CompressionLevel(6))
+        .map_err(zstd_error)?;
+    compressor.ref_prefix(base).map_err(zstd_error)?;
+    let mut compressed = vec![0; compress_bound(bytes.len())];
+    let written = compressor
+        .compress2(compressed.as_mut_slice(), &source)
+        .map_err(zstd_error)?;
+    compressed.truncate(written);
+    Ok(compressed)
+}
+
+/// Recover a target from one frame and its verified-length base bytes.
+#[cfg(feature = "zstandard")]
+pub(crate) fn decode_delta(
+    bytes: &[u8],
+    length: usize,
+    base: &[u8],
+    encoding: Encoding,
+    mask: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let mut output = decode_zstd(bytes, length, base)?;
+    apply_encoding(&mut output, encoding, mask)?;
+    Ok(output)
+}
+
+/// Translate an error from the Zstandard context API.
+#[cfg(feature = "zstandard")]
+fn zstd_error(code: usize) -> Error {
+    Error::Invalid(format!(
+        "Zstandard: {}",
+        zstd::zstd_safe::get_error_name(code)
+    ))
 }
 
 /// Encrypt one prepared object, binding the exact manifest and object index.
@@ -392,6 +516,18 @@ fn associated_data(manifest_hash: &[u8; 32], object_index: usize) -> Result<[u8;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_codec_rejects_unknown_fields() {
+        assert_eq!(
+            serde_json::from_str::<StoredCodec>(r#"{"zstd-delta":{"base":2}}"#).unwrap(),
+            StoredCodec::ZstdDelta { base: 2 }
+        );
+        assert!(
+            serde_json::from_str::<StoredCodec>(r#"{"zstd-delta":{"base":2,"unknown":true}}"#)
+                .is_err()
+        );
+    }
 
     #[test]
     fn nonce_json_is_canonical_fixed_width_and_round_trips() {

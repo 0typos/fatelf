@@ -7,6 +7,7 @@ use object::{Object, ObjectSection};
 
 const COMPRESSION: u8 = 1;
 const ENCRYPTION: u8 = 2;
+const ZSTANDARD: u8 = 4;
 
 /// Allocated descriptor survives stripping; the entrypoint references it as well.
 #[used]
@@ -21,7 +22,8 @@ static DESCRIPTOR: [u8; 16] = [
     b'0',
     b'3',
     (cfg!(feature = "compression") as u8 * COMPRESSION)
-        | (cfg!(feature = "encryption") as u8 * ENCRYPTION),
+        | (cfg!(feature = "encryption") as u8 * ENCRYPTION)
+        | (cfg!(feature = "zstandard") as u8 * ZSTANDARD),
     0,
     0,
     0,
@@ -93,13 +95,17 @@ pub(crate) fn set_launcher_identity(
 pub(crate) struct LauncherCodecs {
     pub(crate) compression: bool,
     pub(crate) encryption: bool,
+    pub(crate) zstandard: bool,
 }
 
 #[cfg(feature = "builder")]
 impl LauncherCodecs {
     /// Check the optional codecs actually used by the prepared bundle.
     pub(crate) fn validate(&self, required: Self) -> Result<(), Error> {
-        if required.compression && !self.compression || required.encryption && !self.encryption {
+        if required.compression && !self.compression
+            || required.encryption && !self.encryption
+            || required.zstandard && !self.zstandard
+        {
             return Err(Error::Invalid(
                 "launcher does not support the selected codecs".into(),
             ));
@@ -126,7 +132,7 @@ pub(crate) fn launcher_codecs<'data>(elf: &impl Object<'data>) -> Result<Launche
     if sections.next().is_some()
         || descriptor.len() != 16
         || &descriptor[..6] != b"FATCAP"
-        || descriptor[8] & !(COMPRESSION | ENCRYPTION) != 0
+        || descriptor[8] & !(COMPRESSION | ENCRYPTION | ZSTANDARD) != 0
         || descriptor[9..].iter().any(|&byte| byte != 0)
     {
         return Err(Error::Invalid(
@@ -143,5 +149,6 @@ pub(crate) fn launcher_codecs<'data>(elf: &impl Object<'data>) -> Result<Launche
     Ok(LauncherCodecs {
         compression: descriptor[8] & COMPRESSION != 0,
         encryption: descriptor[8] & ENCRYPTION != 0,
+        zstandard: descriptor[8] & ZSTANDARD != 0,
     })
 }

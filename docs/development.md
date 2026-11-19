@@ -24,10 +24,11 @@ with `cargo install --locked <package>`. The documented static target is
 just ci
 just fuzz
 just fuzz-config
-just release # Static musl packer + size-optimized launcher supporting both codecs.
+just release # Static musl packer and launcher supporting all codecs.
 just launcher '' # Core launcher without optional compression/encryption decoders.
 just launcher compression
 just launcher encryption
+just launcher zstandard
 ```
 
 `just launcher` writes `target/x86_64-unknown-linux-musl/launcher/fatelf-launcher`;
@@ -45,12 +46,12 @@ To keep native hashing on x86_64, use the same Cargo command without `compact-ha
 
 ```sh
 bash docs/release/zigbuild --locked --profile launcher --no-default-features \
-  --features compression,encryption --target x86_64-unknown-linux-musl --bin fatelf-launcher
+  --features compression,encryption,zstandard --target x86_64-unknown-linux-musl --bin fatelf-launcher
 ```
 
 This direct build writes under `target/fatelf-distribution/`.
 
-The default `builder` feature enables the packer and both codecs;
+The default `builder` feature enables the packer and all codecs;
 `--no-default-features` exposes the runtime entrypoint and runtime error variants.
 `compact-hash` is additive; explicitly enabling it with `builder` changes hashing
 there too because Cargo unifies dependency features. Normal builder defaults stay native.

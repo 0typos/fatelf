@@ -451,7 +451,7 @@ impl PackOptions {
             self.budgets.clone(),
             self.xor_mask.as_deref().unwrap_or_default(),
         )?;
-        let mut payloads = Vec::new();
+        let mut payloads: Vec<Payload> = Vec::new();
         let body_encoding = if self.xor_mask.is_some() {
             Encoding::XorMask
         } else if self.xor {
@@ -491,6 +491,7 @@ impl PackOptions {
                         Encoding::ElfHeaderXorA5,
                         &policy,
                         self.dedup,
+                        None,
                     )?);
                 }
                 let start = range.start.max(header_length);
@@ -501,7 +502,17 @@ impl PackOptions {
                                 "too many payload object references".into(),
                             ));
                         }
-                        chunks.push(pool.insert(bytes, body_encoding, &policy, self.dedup)?);
+                        let base = payloads
+                            .first()
+                            .and_then(|payload| payload.chunks.get(chunks.len()))
+                            .copied();
+                        chunks.push(pool.insert(
+                            bytes,
+                            body_encoding,
+                            &policy,
+                            self.dedup,
+                            base,
+                        )?);
                     }
                 }
             }
@@ -522,6 +533,7 @@ impl PackOptions {
         launcher_codecs.validate(LauncherCodecs {
             compression: chunks.iter().any(|c| c.codec == StoredCodec::Lz4Block),
             encryption: chunks.iter().any(|c| c.encryption.is_some()),
+            zstandard: chunks.iter().any(|c| c.codec.uses_zstd()),
         })?;
         let used: HashSet<&str> = chunks
             .iter()
@@ -826,6 +838,7 @@ impl<'a> Pool<'a> {
         encoding: Encoding,
         policy: &Policy,
         dedup: bool,
+        base: Option<usize>,
     ) -> Result<usize, Error> {
         if bytes.is_empty() || bytes.len() as u64 > self.budgets.max_object_bytes {
             return Err(Error::Invalid(
@@ -845,16 +858,7 @@ impl<'a> Pool<'a> {
                 if object.decoded_length != bytes.len() as u64 {
                     continue;
                 }
-                self.file.seek(SeekFrom::Start(object.spool_offset))?;
-                let mut encoded = vec![0; object.stored_length as usize];
-                self.file.read_exact(&mut encoded)?;
-                if codec::decode(
-                    encoded,
-                    bytes.len(),
-                    object.codec,
-                    object.encoding,
-                    self.xor_mask,
-                )? == bytes
+                if Self::decode_spooled(&mut self.file, &self.objects, id, self.xor_mask)? == bytes
                 {
                     return Ok(id);
                 }
@@ -863,8 +867,22 @@ impl<'a> Pool<'a> {
         if self.objects.len() >= self.budgets.max_objects {
             return Err(Error::Invalid("too many unique objects".into()));
         }
-        let (encoded, stored_codec) =
+        let (mut encoded, mut stored_codec) =
             codec::prepare(bytes, policy.compression, encoding, self.xor_mask)?;
+        if policy.compression == Compression::ZstdDelta
+            && let Some(base) = base
+            && self.objects[base].policy.encryption.is_none()
+            && self.objects[base].decoded_length <= bytes.len() as u64
+        {
+            let decoded_base =
+                Self::decode_spooled(&mut self.file, &self.objects, base, self.xor_mask)?;
+            let delta = codec::prepare_delta(bytes, &decoded_base, encoding, self.xor_mask)?;
+            // Reserve room for the longer codec field and base index in the manifest.
+            if delta.len().saturating_add(32) < encoded.len() {
+                encoded = delta;
+                stored_codec = StoredCodec::ZstdDelta { base };
+            }
+        }
         let spool_offset = self.file.seek(SeekFrom::End(0))?;
         spool_offset
             .checked_add(encoded.len() as u64)
@@ -884,6 +902,39 @@ impl<'a> Pool<'a> {
             self.candidates.entry(key).or_default().push(id);
         }
         Ok(id)
+    }
+
+    /// Read one stored object before encryption is applied.
+    fn read_spooled(file: &mut File, object: &Object) -> Result<Vec<u8>, Error> {
+        file.seek(SeekFrom::Start(object.spool_offset))?;
+        let mut encoded = vec![0; object.stored_length as usize];
+        file.read_exact(&mut encoded)?;
+        Ok(encoded)
+    }
+
+    /// Decode spool candidates for exact deduplication, including one-hop deltas.
+    fn decode_spooled(
+        file: &mut File,
+        objects: &[Object],
+        id: usize,
+        mask: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let object = &objects[id];
+        let encoded = Self::read_spooled(file, object)?;
+        let length = object.decoded_length as usize;
+        if let StoredCodec::ZstdDelta { base } = object.codec {
+            let base = &objects[base];
+            let prefix = codec::decode(
+                Self::read_spooled(file, base)?,
+                base.decoded_length as usize,
+                base.codec,
+                base.encoding,
+                mask,
+            )?;
+            codec::decode_delta(&encoded, length, &prefix, object.encoding, mask)
+        } else {
+            codec::decode(encoded, length, object.codec, object.encoding, mask)
+        }
     }
 
     /// Assign physical offsets, shuffling eligible contiguous runs between fixed anchors.
@@ -1331,22 +1382,22 @@ mod tests {
         };
         for bytes in [&[][..], &[0; 5]] {
             assert!(
-                pool.insert(bytes, Encoding::Identity, &policy, true)
+                pool.insert(bytes, Encoding::Identity, &policy, true, None)
                     .is_err()
             );
         }
         let full = pool
-            .insert(b"abcd", Encoding::Identity, &policy, true)
+            .insert(b"abcd", Encoding::Identity, &policy, true, None)
             .unwrap();
         assert_eq!(
-            pool.insert(b"abcd", Encoding::Identity, &policy, true)
+            pool.insert(b"abcd", Encoding::Identity, &policy, true, None)
                 .unwrap(),
             full
         );
-        pool.insert(b"e", Encoding::Identity, &policy, true)
+        pool.insert(b"e", Encoding::Identity, &policy, true, None)
             .unwrap();
         let error = pool
-            .insert(b"f", Encoding::Identity, &policy, true)
+            .insert(b"f", Encoding::Identity, &policy, true, None)
             .unwrap_err();
         assert_eq!(error.to_string(), "encoded spool exceeds configured budget");
     }
@@ -1363,7 +1414,7 @@ mod tests {
                 shuffle,
                 encryption: None,
             };
-            pool.insert(&[index as u8], Encoding::Identity, &policy, false)
+            pool.insert(&[index as u8], Encoding::Identity, &policy, false, None)
                 .unwrap();
         }
         let (chunks, length) = pool.layout(Order::Shuffled, 0).unwrap();

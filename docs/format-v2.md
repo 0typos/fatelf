@@ -40,13 +40,21 @@ RustCrypto `chacha20poly1305` 0.11.0.
 The strict JSON manifest contains version, selection/default, backend, manifest
 position, budgets, runtime key references, unique `chunks`, and `payloads`.
 Each chunk has pool-relative `offset`, stored `length`, `decoded_length`, actual
-`codec` (`raw`/`lz4-block`), `encoding`, and optional encryption key ID/48-character
+`codec` (`raw`, `lz4-block`, `zstd-frame`, or `{"zstd-delta":{"base":N}}`),
+`encoding`, and optional encryption key ID/48-character
 nonce. Each payload has name, original length, `header_length`, BLAKE3 hex hash,
 and ordered chunk indices. Its first reference is exactly one masked 52/64-byte
 ELF header. Body references use `identity`, `xor-a5`, or `xor-mask`.
 Noncanonical header extensions are rejected. `inspect` reports placement and object statistics.
 
 The header and `xor-a5` encodings apply the public byte mask `0xA5`.
+Zstandard objects contain one complete frame with its exact decoded size.
+A delta uses the original bytes of object `N` as its Zstandard reference
+prefix. The base must be an earlier independent, unencrypted body object
+whose decoded size does not exceed the target's. The launcher checks the
+final payload digest before launching or publishing the reconstructed bytes.
+These additive codec forms leave existing v2 bundles readable. Bundles
+using either Zstandard form require a launcher with Zstandard support.
 The `xor-mask` encoding repeats the public manifest `xor_mask` array (1–32
 bytes), starting at its first byte for every object. The array is required
 when any object uses `xor-mask` and otherwise omitted. Encoding precedes compression
@@ -62,8 +70,8 @@ Nonces/lengths/offsets are finalized before encryption; ciphertext tags are not
 manifest fields, avoiding a circular commitment.
 
 Current builders require a single 16-byte `.fatelf` launcher descriptor.
-Its first eight bytes are ASCII `FATCAP03`, byte 8 carries the optional LZ4
-and AEAD capability bits (bits 0 and 1), and the seven remaining bytes are
+Its first eight bytes are ASCII `FATCAP03`, byte 8 carries the optional LZ4,
+AEAD, and Zstandard capability bits (bits 0, 1, and 2), and the seven remaining bytes are
 zero. This launcher compatibility revision covers both XOR encodings and is
 independent of the v2 container format. Upgrade the packer and launcher as a
 pair when building new bundles. Existing v2 bundles retain their own launcher

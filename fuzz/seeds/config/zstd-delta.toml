@@ -1,0 +1,15 @@
+version = 2
+output = "combined"
+
+[storage]
+compression = "zstd-delta"
+chunk_size = 1048576
+dedup = true
+
+[[payloads]]
+name = "base"
+path = "/usr/bin/true"
+
+[[payloads]]
+name = "update"
+path = "/usr/bin/false"
