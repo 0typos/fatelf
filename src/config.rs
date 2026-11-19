@@ -608,33 +608,43 @@ mod tests {
 
     #[test]
     fn save_preserves_an_owner_or_group_that_differs_from_the_staged_file() {
-        let gid = rustix::process::getegid();
         let root = rustix::process::geteuid().is_root();
-        let alternate_gid = if root {
-            Some(Gid::from_raw(if gid.as_raw() == 1 { 2 } else { 1 }))
-        } else {
-            rustix::process::getgroups()
-                .unwrap()
-                .into_iter()
-                .find(|&candidate| candidate != gid)
-        };
-        let alternate_uid = root.then(|| Uid::from_raw(1));
-        for (owner, group) in [(None, alternate_gid), (alternate_uid, None)] {
+        let groups = rustix::process::getgroups().unwrap();
+        for change_owner in [false, true] {
+            let source = tempfile::tempfile().unwrap();
+            let staged = tempfile::tempfile().unwrap();
+            let original_staged = staged.metadata().unwrap();
+            let (owner, group) = if change_owner {
+                (root.then(|| Uid::from_raw(1)), None)
+            } else {
+                let current = original_staged.gid();
+                let group = if root {
+                    Some(Gid::from_raw(if current == 1 { 2 } else { 1 }))
+                } else {
+                    groups
+                        .iter()
+                        .copied()
+                        .find(|candidate| candidate.as_raw() != current)
+                };
+                (None, group)
+            };
             if owner.is_none() && group.is_none() {
                 continue;
             }
-            let source = tempfile::tempfile().unwrap();
-            let staged = tempfile::tempfile().unwrap();
             match fchown(&source, owner, group) {
                 Ok(()) => {}
                 // A restricted test runner may lack CAP_CHOWN or only map one ID.
                 Err(Errno::PERM | Errno::INVAL) => continue,
                 Err(error) => panic!("could not set fixture ownership: {error}"),
             }
+            let expected = source.metadata().unwrap();
+            assert_ne!(
+                (original_staged.uid(), original_staged.gid()),
+                (expected.uid(), expected.gid()),
+            );
             preserve_access(&source, &staged).unwrap();
-            let source = source.metadata().unwrap();
-            let staged = staged.metadata().unwrap();
-            assert_eq!((staged.uid(), staged.gid()), (source.uid(), source.gid()));
+            let saved = staged.metadata().unwrap();
+            assert_eq!((saved.uid(), saved.gid()), (expected.uid(), expected.gid()));
         }
     }
 

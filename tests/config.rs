@@ -576,24 +576,26 @@ fn doctor_probe_sets_executable_permissions_under_a_restrictive_policy() {
 #include <unistd.h>
 
 int main(int argc, char **argv) {
-    if (argc < 2) return 2;
+    if (argc < 3) return 2;
     const unsigned int mode = offsetof(struct seccomp_data, args[1])
         + (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__ ? 4 : 0);
+    const unsigned int allowed_mode = argv[1][0] == 'd' ? ~0U : 0700;
     struct sock_filter filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fchmod, 0, 3),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, mode),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0700, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, allowed_mode, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
     struct sock_fprog program = { sizeof filter / sizeof filter[0], filter };
     if (prctl(PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL)
-        || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program)) {
+        || prctl(PR_SET_SECCOMP, (unsigned long)SECCOMP_MODE_FILTER,
+                 (unsigned long)&program, 0UL, 0UL)) {
         perror("installing the probe test policy");
         return 77;
     }
-    execv(argv[1], argv + 1);
+    execv(argv[2], argv + 2);
     perror("executing fatelf");
     return 127;
 }
@@ -608,15 +610,26 @@ int main(int argc, char **argv) {
             .output()
             .unwrap(),
     );
-    let output = Command::new(&wrapper)
-        .arg(env!("CARGO_BIN_EXE_fatelf"))
-        .args(["doctor", "--probe", "--config"])
-        .arg(&path)
-        .output()
-        .unwrap();
-    if output.status.code() != Some(77) {
-        success(&output);
-        assert!(String::from_utf8_lossy(&output.stdout).contains("ok memfd_probe "));
+    for (policy, expected) in [("allow-0700", "ok"), ("deny", "error")] {
+        let output = Command::new(&wrapper)
+            .arg(policy)
+            .arg(env!("CARGO_BIN_EXE_fatelf"))
+            .args(["doctor", "--json", "--probe", "--config"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        if output.status.code() == Some(77) {
+            return;
+        }
+        assert_eq!(output.status.success(), expected == "ok");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| { check["code"] == "memfd_probe" && check["status"] == expected })
+        );
     }
 }
 
