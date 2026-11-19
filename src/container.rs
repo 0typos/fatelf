@@ -577,7 +577,7 @@ mod tests {
         RuntimeKey,
     };
     use crate::codec::{Encoding, StoredCodec};
-    use std::io::Cursor;
+    use std::io::{Cursor, Seek, SeekFrom, Write};
 
     /// Minimal ELF64 header plus a body; original bytes are an independent decoder oracle.
     fn original() -> Vec<u8> {
@@ -743,6 +743,299 @@ mod tests {
             mutate(&mut invalid);
             assert!(Container::open(Cursor::new(image(&invalid))).is_err());
         }
+    }
+
+    #[test]
+    fn locator_bounds_hold_independently_of_the_metadata() {
+        let data = manifest(Position::End);
+        let baseline = image(&data);
+        let footer = baseline.len() - FOOTER_LEN as usize;
+        for (name, field, value) in [
+            ("zero launcher", 8, 0_u64),
+            ("manifest begins inside launcher", 8, 74),
+            ("empty manifest", 24, 0),
+            ("manifest reaches into footer", 24, footer as u64),
+        ] {
+            let mut bytes = baseline.clone();
+            bytes[footer + field..footer + field + 8].copy_from_slice(&value.to_le_bytes());
+            let error = Container::open(Cursor::new(bytes)).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid footer offsets or manifest size"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn locator_accepts_maximum_launcher_and_rejects_one_byte_more() {
+        for (launcher_length, valid) in [(1_073_741_824_u64, true), (1_073_741_825, false)] {
+            let mut bytes = image(&manifest(Position::End));
+            let footer = bytes.len() - FOOTER_LEN as usize;
+            bytes[footer + 8..footer + 16].copy_from_slice(&launcher_length.to_le_bytes());
+            bytes[footer + 16..footer + 24].copy_from_slice(&(launcher_length + 69).to_le_bytes());
+            let mut file = tempfile::tempfile().unwrap();
+            file.seek(SeekFrom::Start(launcher_length)).unwrap();
+            file.write_all(&bytes[4..]).unwrap();
+            assert_eq!(
+                Container::open(file).is_ok(),
+                valid,
+                "size {launcher_length}"
+            );
+        }
+    }
+
+    #[test]
+    fn locator_accepts_maximum_manifest_and_rejects_one_byte_more() {
+        let mut data = manifest(Position::End);
+        data.budgets.max_manifest_bytes = 16_777_216;
+        for (manifest_length, valid) in [(16_777_216_usize, true), (16_777_217, false)] {
+            let original = image(&data);
+            let mut json = serde_json::to_vec(&data).unwrap();
+            json.resize(manifest_length, b' ');
+            let mut bytes = original[..73].to_vec();
+            bytes.extend(&json);
+            bytes.extend(MAGIC);
+            bytes.extend(4_u64.to_le_bytes());
+            bytes.extend(73_u64.to_le_bytes());
+            bytes.extend((manifest_length as u64).to_le_bytes());
+            bytes.extend(blake3::hash(&json).as_bytes());
+            let result = Container::open(Cursor::new(bytes));
+            assert_eq!(result.is_ok(), valid, "size {manifest_length}");
+            if !valid {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("invalid footer offsets or manifest size")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_position_must_match_the_physical_layout() {
+        for position in [Position::Front, Position::End] {
+            let mut bytes = image(&manifest(position));
+            let footer = bytes.len() - FOOTER_LEN as usize;
+            match position {
+                Position::Front => {
+                    bytes.insert(4, 0);
+                    bytes[footer + 17..footer + 25].copy_from_slice(&5_u64.to_le_bytes());
+                }
+                Position::End => bytes.insert(footer, 0),
+            }
+            let error = Container::open(Cursor::new(bytes)).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("manifest position contradicts locator"),
+                "{position:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_environment_must_be_a_portable_identifier_of_at_most_128_bytes() {
+        for (name, expected) in [
+            ("_APP9".into(), true),
+            ("A".repeat(128), true),
+            ("A".repeat(129), false),
+            ("0APP".into(), false),
+            ("APP=".into(), false),
+            (String::new(), false),
+        ] {
+            let mut data = manifest(Position::End);
+            data.select_env = name.clone();
+            assert_eq!(
+                Container::open(Cursor::new(image(&data))).is_ok(),
+                expected,
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_selector_labels_must_be_nonempty_and_at_most_64_bytes() {
+        for (label, expected) in [
+            ("A9_.-".into(), true),
+            ("A".repeat(64), true),
+            ("A".repeat(65), false),
+            ("A/B".into(), false),
+            (String::new(), false),
+        ] {
+            let mut data = manifest(Position::End);
+            data.payloads[0].name = label.clone();
+            data.default = label.clone();
+            assert_eq!(
+                Container::open(Cursor::new(image(&data))).is_ok(),
+                expected,
+                "{label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_budgets_must_be_nonzero_and_within_hard_ceilings() {
+        for (case, change) in [
+            (
+                "zero count",
+                (|m: &mut Manifest| m.budgets.max_payloads = 0) as fn(&mut Manifest),
+            ),
+            ("excess count", |m| m.budgets.max_objects = 1_000_001),
+            ("zero size", |m| m.budgets.max_config_bytes = 0),
+            ("excess size", |m| m.budgets.max_spool_bytes = 2_147_483_649),
+        ] {
+            let mut data = manifest(Position::End);
+            change(&mut data);
+            let error = Container::open(Cursor::new(image(&data))).err().unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("budget is zero or exceeds a hard ceiling"),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_accepts_counts_and_sizes_exactly_at_the_declared_budget() {
+        let mut data = manifest(Position::End);
+        data.budgets.max_payloads = 2;
+        data.budgets.max_payload_bytes = 69;
+        data.budgets.max_logical_bytes = 138;
+        data.budgets.max_object_bytes = 64;
+        data.budgets.max_objects = 2;
+        data.budgets.max_references = 4;
+        data.budgets.max_stored_bytes = 69;
+        data.budgets.max_manifest_bytes = serde_json::to_vec(&data).unwrap().len() as u64;
+        // The budget becomes part of the metadata, so measure again after
+        // replacing the much wider default decimal number.
+        data.budgets.max_manifest_bytes = serde_json::to_vec(&data).unwrap().len() as u64;
+        assert!(Container::open(Cursor::new(image(&data))).is_ok());
+        data.budgets.max_manifest_bytes -= 1;
+        assert!(Container::open(Cursor::new(image(&data))).is_err());
+    }
+
+    #[test]
+    fn reader_rejects_invalid_manifest_checks_at_their_validation_stage() {
+        for (case, change, expected) in [
+            (
+                "version",
+                (|m: &mut Manifest| m.version = 3) as fn(&mut Manifest),
+                "unsupported version or payload count",
+            ),
+            (
+                "too many payloads",
+                |m| m.budgets.max_payloads = 1,
+                "unsupported version or payload count",
+            ),
+            (
+                "no payloads",
+                |m| m.payloads.clear(),
+                "unsupported version or payload count",
+            ),
+            (
+                "too many objects",
+                |m| m.budgets.max_objects = 1,
+                "object count or stored pool exceeds budget",
+            ),
+            (
+                "empty object table",
+                |m| m.chunks.clear(),
+                "object count or stored pool exceeds budget",
+            ),
+            (
+                "oversized pool",
+                |m| m.budgets.max_stored_bytes = 68,
+                "object count or stored pool exceeds budget",
+            ),
+            (
+                "empty decoded chunk",
+                |m| m.chunks[0].decoded_length = 0,
+                "object outside pool or exceeds budget",
+            ),
+            (
+                "oversized decoded chunk",
+                |m| {
+                    m.chunks[0].decoded_length = 65;
+                    m.budgets.max_object_bytes = 64
+                },
+                "object outside pool or exceeds budget",
+            ),
+            (
+                "empty stored chunk",
+                |m| m.chunks[0].length = 0,
+                "object outside pool or exceeds budget",
+            ),
+            (
+                "oversized stored chunk",
+                |m| {
+                    m.chunks[0].length = 65;
+                    m.budgets.max_object_bytes = 64
+                },
+                "object outside pool or exceeds budget",
+            ),
+            (
+                "out-of-pool end",
+                |m| m.chunks[0].offset = 10,
+                "object outside pool or exceeds budget",
+            ),
+            (
+                "raw size mismatch",
+                |m| m.chunks[0].length = 63,
+                "raw object length mismatch",
+            ),
+            (
+                "empty payload",
+                |m| m.payloads[0].length = 0,
+                "invalid payload or header length",
+            ),
+            (
+                "oversized payload",
+                |m| {
+                    m.payloads[0].length = 70;
+                    m.budgets.max_payload_bytes = 69
+                },
+                "invalid payload or header length",
+            ),
+            (
+                "lz4 size tie",
+                |m| m.chunks[0].codec = StoredCodec::Lz4Block,
+                "LZ4 object must be smaller",
+            ),
+        ] {
+            let mut data = manifest(Position::End);
+            change(&mut data);
+            let error = Container::open(Cursor::new(image(&data))).err().unwrap();
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+        }
+    }
+
+    #[test]
+    fn key_declarations_allow_sixty_four_distinct_names_and_environment_variables() {
+        let mut data = manifest(Position::End);
+        for index in 0..64 {
+            data.keys.push(RuntimeKey {
+                name: format!("key-{index}"),
+                env: format!("KEY_{index}"),
+            });
+        }
+        assert!(Container::open(Cursor::new(image(&data))).is_ok());
+        data.keys.push(RuntimeKey {
+            name: "extra".into(),
+            env: "EXTRA_KEY".into(),
+        });
+        let error = Container::open(Cursor::new(image(&data))).err().unwrap();
+        assert!(error.to_string().contains("too many key references"));
+        data.keys.pop();
+        data.keys[1].env = data.keys[0].env.clone();
+        assert!(Container::open(Cursor::new(image(&data))).is_err());
+        data.keys[1].env = "UNIQUE_KEY".into();
+        data.keys[1].name = data.keys[0].name.clone();
+        assert!(Container::open(Cursor::new(image(&data))).is_err());
     }
 
     #[test]
