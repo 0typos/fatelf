@@ -9,27 +9,22 @@ DEMO_BIN="$DEMO_ROOT/target/x86_64-unknown-linux-musl/release"
 export PATH="$DEMO_BIN:$PATH"
 COLS=${COLS:-110}
 ROWS=${ROWS:-34}
+DEMO_PAUSE=${DEMO_PAUSE:-0.75}
 
 say() {
   printf '\n\033[38;2;0;207;232m# %s\033[0m\n' "$1"
-  sleep 1
+  sleep "$DEMO_PAUSE"
 }
 
 run() {
-  printf '\033[38;2;255;176;0m$\033[0m '
-  local index
-  for ((index = 0; index < ${#1}; index++)); do
-    printf '%s' "${1:index:1}"
-    sleep 0.012
-  done
-  printf '\n'
+  printf '\033[38;2;255;176;0m$\033[0m %s\n' "$1"
   eval "$1"
-  sleep 1.4
+  sleep "$DEMO_PAUSE"
 }
 
 render() {
   agg --quiet --cols "$COLS" --rows "$ROWS" --font-size 14 \
-    --idle-time-limit 3 "$DEMO_HERE/$1.cast" "$DEMO_HERE/$1.gif"
+    --idle-time-limit 3 "$1" "$2"
 }
 
 if [[ ${1:-} == --play ]]; then
@@ -47,6 +42,7 @@ if [[ ${1:-} == --play ]]; then
   touch samples/alpha.txt samples/beta.txt samples/gamma.txt
   unset FATELF_APP PS_KEY_FILE
   say "Two real dynamically linked ELF programs, one executable entrypoint."
+  run 'fatelf --version'
   run 'file /usr/bin/ls /usr/bin/ps'
   if [[ $backend == memfd ]]; then
     say "Only ps is shuffled; both embedded ELF headers are masked."
@@ -134,24 +130,41 @@ cmp bundled-ps.stdout native-ps.stdout'
   exit 0
 fi
 
+mode=record
 case ${1:-} in
-  '') gif=1 ;;
-  --no-gif) gif=0 ;;
-  --render) render 01-ls-ps-memfd; render 02-ls-ps-toml-file; exit 0 ;;
-  *) printf 'Usage: %s [--no-gif|--render|--play memfd|--play file]\n' "$0" >&2; exit 2 ;;
+  --no-gif) mode=cast; shift ;;
+  --render) mode=render; shift ;;
 esac
+case ${1:-all} in
+  all) backends=(memfd file) ;;
+  memfd|file) backends=("$1") ;;
+  *) printf 'Usage: %s [--no-gif|--render] [all|memfd|file]\n' "$0" >&2; exit 2 ;;
+esac
+if (($# > 1)); then exit 2; fi
 
-command -v asciinema >/dev/null
-if ((gif)); then command -v agg >/dev/null; fi
-mkdir -p "$DEMO_ROOT/target"
-status_dir=$(mktemp -d "$DEMO_ROOT/target/record-status.XXXXXX")
-for backend in memfd file; do
+if [[ $mode != render ]]; then command -v asciinema >/dev/null; fi
+if [[ $mode != cast ]]; then command -v agg >/dev/null; fi
+staging=$(mktemp -d "$DEMO_HERE/.record.XXXXXX")
+trap 'rm -rf -- "$staging"' EXIT
+for backend in "${backends[@]}"; do
   if [[ $backend == memfd ]]; then name=01-ls-ps-memfd; else name=02-ls-ps-toml-file; fi
-  export FATELF_RECORD_STATUS="$status_dir/$backend"
+  if [[ $mode == render ]]; then
+    render "$DEMO_HERE/$name.cast" "$staging/$name.gif"
+    mv -- "$staging/$name.gif" "$DEMO_HERE/$name.gif"
+    continue
+  fi
+  export FATELF_RECORD_STATUS="$staging/$backend.status"
   printf -v record_command 'bash %q --play %q' "$DEMO_HERE/record" "$backend"
-  asciinema rec --overwrite --quiet --cols "$COLS" --rows "$ROWS" \
+  asciinema rec --quiet --cols "$COLS" --rows "$ROWS" \
     --idle-time-limit 3 --title "fatelf: ls + ps ($backend)" --env '' \
-    --command "$record_command" "$DEMO_HERE/$name.cast"
-  test "$(cat "$FATELF_RECORD_STATUS")" = 0
-  if ((gif)); then render "$name"; fi
+    --command "$record_command" "$staging/$name.cast"
+  if [[ ! -f $FATELF_RECORD_STATUS || $(<"$FATELF_RECORD_STATUS") != 0 ]]; then
+    printf 'Recording failed for %s. Run %s --play %s to diagnose.\n' "$backend" "$0" "$backend" >&2
+    exit 1
+  fi
+  if [[ $mode == record ]]; then
+    render "$staging/$name.cast" "$staging/$name.gif"
+    mv -- "$staging/$name.gif" "$DEMO_HERE/$name.gif"
+  fi
+  mv -- "$staging/$name.cast" "$DEMO_HERE/$name.cast"
 done

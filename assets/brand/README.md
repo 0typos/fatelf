@@ -1,5 +1,11 @@
 # Fatelf brand
 
+- `fatelf-banner.png` is the landscape README header. It pairs the wordmark
+  with the v6 mascot carrying three file cards. The 1440 × 480 PNG is a
+  downscaled export of an image generated using v6 as the character reference.
+- `fatelf-mark-v6.png` is the square mascot master for profiles and icons.
+  Keep the navy background and original aspect ratio when resizing.
+
 Current v6 edit prompt (built-in image generation; `fatelf-mark-v5.png` target):
 
 > Use case: precise-object-edit / logo-brand. Create a NON-CHRISTMAS version of this fatelf mascot. Preserve the same enormously fat adult fantasy elf, recognizable pointed ears, blond hair, friendly mischievous wink and grin, thumbs-up pose, huge round body, bursting jacket and tearing undershirt, magenta trousers, flying buttons/buckle/fabric, composition, bold clean cartoon illustration, and deep-ink navy #071526 background. Preserve exact undershirt text 'EXTRA LARGE' on one line and 'FORMAT' on the next, dark navy bold lettering, with no ELF prefix. Remove ALL Christmas details: no string lights or cables, no light bulbs, no bells, no fur cuffs or fur collar, no fluffy pom-pom, no Santa-style cap, no holiday decorations. Replace the seasonal outfit with a generic fantasy elf's too-small adventuring jacket, simple pointed soft cap without pom-pom or fur, practical cuffed pointed boots and plain wrist guards. Make the visual identity focused on THREE strong colors: brilliant CYAN #00CFE8 as the dominant jacket and cap color, vivid YELLOW #FFD600 for hardware, buckle, seams and selected burst accents, and hot MAGENTA #FF1688 trousers and some fabric accents. Replace green with cyan, replace brown leather with deep navy with cyan/magenta accents; warm natural skin and pale neutral undershirt are fine. Keep most belly covered by the stretched undershirt with small seam tears. Add clean cyan, yellow and magenta radial comic burst strokes and flying cloth scraps, not holiday lights. Confident heroic playful oversized elf squeezing out of his gear; no injury, no fire, no other characters, no scenery, no watermark or extra text. Keep full figure and burst pieces unclipped with readable silhouette at icon scale.
@@ -20,7 +26,7 @@ A very large, confident fantasy elf bursting out of undersized adventuring gear:
 literal mascot for packing more programs into one executable. The opaque
 deep-ink background and cyan, yellow, and magenta accents follow the typo family.
 
-`fatelf-mark-v6.png` is the generated master used by the README, with a tearing
+`fatelf-mark-v6.png` is the generated square master, with a tearing
 undershirt reading "EXTRA LARGE FORMAT" and cyan/yellow/magenta adventuring gear.
 It has no seasonal decorations. Earlier versions, including the Christmas
 variants, are preserved. Render the master smaller

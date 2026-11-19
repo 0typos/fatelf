@@ -124,7 +124,7 @@ fn selection_preserves_raw_arguments_environment_and_exit_status() {
         let argument = OsString::from_vec(b"raw\xffargument".to_vec());
         let variable = OsString::from_vec(b"raw\xfeenvironment".to_vec());
         let output = Command::new(&binary)
-            .arg("context")
+            .arg("context-with-selector-check")
             .arg(&argument)
             .env("CUSTOM_CHOICE", "a")
             .env("FATELF_PROBE", &variable)
@@ -133,7 +133,9 @@ fn selection_preserves_raw_arguments_environment_and_exit_status() {
         success(&output);
         let mut expected = b"a\0".to_vec();
         expected.extend_from_slice(binary.as_os_str().as_bytes());
-        expected.extend_from_slice(b"\0context\0raw\xffargument\0raw\xfeenvironment");
+        expected.extend_from_slice(
+            b"\0context-with-selector-check\0raw\xffargument\0raw\xfeenvironment",
+        );
         assert_eq!(
             output.stdout, expected,
             "{backend}: raw Unix argv/env must survive"

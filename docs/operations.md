@@ -30,7 +30,9 @@
   ELF relocatable objects, non-ELF files, and zero-entry x86-64 ELFs are
   rejected when packing. An `ET_DYN` file with an entry point still needs
   a compatible host and loader.
-- Raw Unix argument bytes and environment values, working directory, PID,
+- The launcher consumes the configured selector and excludes it and the
+  configured key-source variables from the payload environment.
+- Raw Unix argument bytes and other environment values, working directory, PID,
   inherited descriptors, and exit/signal termination semantics are retained.
   `argv[0]` remains the invocation of the combined binary. Test the intended
   bundle name when wrapping tools that dispatch on it. For example, Git treats

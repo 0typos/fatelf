@@ -272,7 +272,8 @@ then both originals were extracted and compared byte-for-byte. Each actual file
 size equals its plan. Keyless ls and missing-key ps behavior, both execution
 backends, front/end placement and masked source headers were checked; the independent
 scanner again found a plausible complete ELF header only at offset 0. The launcher optimization changed symbol offsets. Raw magic positions were
-recorded in the local measurements. The earlier recordings remain valid for the unchanged commands/format.
+recorded in the local measurements. The tutorial recordings show the release
+version and measurements from their own recording host.
 For this pass, `just ci` passed all 44 tests plus format/clippy/cargo-deny;
 minimal compact core/compression/encryption clippy and `just release` also exited 0.
 RustSec was refreshed before release. Fuzz targets were not rerun because this

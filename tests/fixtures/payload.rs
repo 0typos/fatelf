@@ -21,6 +21,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         _ => {
+            if mode == "context-with-selector-check" {
+                assert!(env::var_os("CUSTOM_CHOICE").is_none(), "selector leaked to payload");
+            }
             let label = if cfg!(variant_a) { b"a" } else { b"b" };
             let mut out = io::stdout().lock();
             out.write_all(label).unwrap();

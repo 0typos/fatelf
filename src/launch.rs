@@ -32,12 +32,13 @@ pub(crate) fn run() -> Result<(), Error> {
         None => &container.manifest.default,
     };
     let index = container.payload_index(name)?;
-    let private_environment: Vec<String> = container
+    let mut private_environment: Vec<String> = container
         .manifest
         .keys
         .iter()
         .map(|key| key.env.clone())
         .collect();
+    private_environment.push(container.manifest.select_env.clone());
     let backend = container.manifest.backend;
     let label = container.manifest.payloads[index].name.clone();
     let executable = match backend {

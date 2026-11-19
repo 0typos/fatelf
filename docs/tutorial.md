@@ -16,7 +16,7 @@ Run from this repository on a compatible Linux host with `/usr/bin/ls`,
 `/usr/bin/ps`, their libraries, and `/proc` available. The release recipe requires
 this repository's configured Rust, musl, Zig and cargo build tooling.
 The examples use standalone GNU `ls`. On hosts with a multicall implementation
-of `ls`, follow the [quickstart](../README.md#pack-run-and-verify) with Bash
+of `ls`, follow the [quickstart](../README.md#quickstart) with Bash
 and `ps`.
 
 ```bash
@@ -62,7 +62,8 @@ FATELF_APP=ps "$demo_dir/combined" -p 1 -o pid,comm
 
 The `ls` commands list `alpha.txt` and `beta.txt`; `ps` prints PID/COMMAND for
 PID 1. The process name depends on the host. Empty or unknown selector values
-fail. `argv[0]` remains the combined path.
+fail. `argv[0]` remains the combined path, and the launcher removes
+`FATELF_APP` before executing the payload.
 
 ## 3. Recover and compare the original bytes
 
@@ -177,7 +178,7 @@ Keep the key separate from the container. Unlock variables are removed from
 the launched program's environment. The manifest remains readable, including
 payload labels, routing variable names, object boundaries and key reference
 names. Authentication of encrypted objects does not authenticate a modified
-outer launcher; publisher signatures and encrypted metadata are future work.
+outer launcher. See the [bundle trust model](operations.md#security-boundaries).
 Plaintext becomes available to the launcher and selected program after unlocking.
 
 `memfd` requires host permission for executable memory-backed files. `file`
@@ -195,6 +196,7 @@ asciinema play docs/tutorial/demos/01-ls-ps-memfd.cast
 asciinema play docs/tutorial/demos/02-ls-ps-toml-file.cast
 just demo
 just record-demo
+just record-demo file
 ```
 
 See [recording dependencies and controls](tutorial/demos/README.md). Recording

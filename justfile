@@ -8,9 +8,9 @@ demo:
     bash docs/tutorial/demos/record --play memfd
 
 # Save local asciinema casts and GIFs for both walkthroughs.
-record-demo:
+record-demo backend="all":
     just release
-    bash docs/tutorial/demos/record
+    bash docs/tutorial/demos/record {{quote(backend)}}
 
 fmt:
     cargo fmt --all --check
