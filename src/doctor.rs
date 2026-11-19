@@ -208,3 +208,68 @@ fn storage(path: &Path, executable: bool) -> Result<String, Error> {
         Ok(format!("{available} bytes available"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+
+    use super::{ElfMetadata, StatVfsMountFlags, fs, interpreter, statvfs, storage};
+
+    #[test]
+    fn interpreter_check_requires_a_regular_executable_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("loader");
+        let mut elf = ElfMetadata {
+            architecture: object::Architecture::X86_64,
+            little_endian: true,
+            interpreter: None,
+            codecs: None,
+        };
+        assert_eq!(interpreter(&elf).unwrap(), "no PT_INTERP segment");
+        for candidate in [PathBuf::from(directory.path()), path.clone()] {
+            elf.interpreter = Some(candidate.into_os_string().into_encoded_bytes());
+            let error = interpreter(&elf).unwrap_err();
+            assert!(error.to_string().contains("missing or not a regular file"));
+        }
+        fs::write(&path, b"fixture").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = interpreter(&elf).unwrap_err();
+        assert!(error.to_string().contains("is not executable"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        if statvfs(&path)
+            .unwrap()
+            .f_flag
+            .contains(StatVfsMountFlags::NOEXEC)
+        {
+            return;
+        }
+        assert!(interpreter(&elf).unwrap().ends_with(" is executable"));
+    }
+
+    #[test]
+    fn storage_check_requires_a_writable_directory_and_reports_available_space() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path();
+        let file = path.join("file");
+        fs::write(&file, []).unwrap();
+        assert!(
+            storage(&file, false)
+                .unwrap_err()
+                .to_string()
+                .contains("not a directory")
+        );
+        assert!(storage(path, false).unwrap().contains("bytes available"));
+        let noexec = statvfs(path)
+            .unwrap()
+            .f_flag
+            .contains(StatVfsMountFlags::NOEXEC);
+        assert_eq!(storage(path, true).is_err(), noexec);
+        let original = fs::metadata(path).unwrap().permissions();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = storage(path, false);
+        fs::set_permissions(path, original).unwrap();
+        if !rustix::process::geteuid().is_root() {
+            assert!(result.is_err());
+        }
+    }
+}

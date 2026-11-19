@@ -514,6 +514,113 @@ fn doctor_reports_missing_interpreter_without_building() {
 }
 
 #[test]
+fn doctor_probes_memfd_without_building_and_reports_the_result() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("bundle.toml");
+    let mut config = settings("combined");
+    config["execution"]["backend"] = json!("memfd");
+    fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+    for json in [false, true] {
+        let mut args = vec![
+            "doctor".into(),
+            "--probe".into(),
+            "--config".into(),
+            path.as_os_str().into(),
+        ];
+        if json {
+            args.push("--json".into());
+        }
+        let output = tool(&args, directory.path());
+        success(&output);
+        if json {
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["ok"], true);
+            assert!(
+                report["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|check| { check["code"] == "memfd_probe" && check["status"] == "ok" })
+            );
+        } else {
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.starts_with("ok memfd_probe "))
+            );
+        }
+    }
+    assert!(!directory.path().join("combined").exists());
+}
+
+#[test]
+fn doctor_probe_sets_executable_permissions_under_a_restrictive_policy() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("bundle.toml");
+    let mut config = settings("combined");
+    config["execution"]["backend"] = json!("memfd");
+    fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+    let source = directory.path().join("probe-policy.c");
+    let wrapper = directory.path().join("probe-policy");
+    fs::write(
+        &source,
+        r#"
+#include <errno.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    const unsigned int mode = offsetof(struct seccomp_data, args[1])
+        + (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__ ? 4 : 0);
+    struct sock_filter filter[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_fchmod, 0, 3),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, mode),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0700, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog program = { sizeof filter / sizeof filter[0], filter };
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL)
+        || prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &program)) {
+        perror("installing the probe test policy");
+        return 77;
+    }
+    execv(argv[1], argv + 1);
+    perror("executing fatelf");
+    return 127;
+}
+"#,
+    )
+    .unwrap();
+    success(
+        &Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&wrapper)
+            .output()
+            .unwrap(),
+    );
+    let output = Command::new(&wrapper)
+        .arg(env!("CARGO_BIN_EXE_fatelf"))
+        .args(["doctor", "--probe", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    if output.status.code() != Some(77) {
+        success(&output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ok memfd_probe "));
+    }
+}
+
+#[test]
 fn doctor_returns_json_for_an_invalid_configuration() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("bad.toml");
