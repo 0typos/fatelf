@@ -223,6 +223,32 @@ fn config_read_checks_actual_bytes_even_when_procfs_reports_zero() {
 }
 
 #[test]
+fn xor_mask_generator_and_config_reject_out_of_range_lengths() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("bundle.toml");
+    for length in [0, 33] {
+        let generated = tool(
+            &["xor-mask".into(), length.to_string().into()],
+            directory.path(),
+        );
+        assert!(!generated.status.success(), "{length}");
+        assert!(generated.stdout.is_empty());
+        let mut config = settings("combined");
+        config["storage"]["xor_mask"] = json!(vec![1; length]);
+        fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let build = tool(
+            &["build".into(), "--config".into(), path.as_os_str().into()],
+            directory.path(),
+        );
+        assert!(!build.status.success(), "{length}");
+        assert!(
+            String::from_utf8_lossy(&build.stderr).contains("xor_mask must contain 1 to 32 bytes")
+        );
+        assert!(!directory.path().join("combined").exists());
+    }
+}
+
+#[test]
 fn single_payload_front_manifest_plan_predicts_exact_output_size() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("bundle.toml");
@@ -230,6 +256,13 @@ fn single_payload_front_manifest_plan_predicts_exact_output_size() {
     config["payloads"] = json!([{"name":"b","path":"/usr/bin/false"}]);
     config["storage"]["manifest_position"] = json!("front");
     config["storage"]["compression"] = json!("lz4");
+    let generated = tool(&["xor-mask".into(), "32".into()], directory.path());
+    success(&generated);
+    let setting: toml::Table =
+        toml::from_str(std::str::from_utf8(&generated.stdout).unwrap()).unwrap();
+    let mask = setting["xor_mask"].as_array().unwrap();
+    assert_eq!(mask.len(), 32);
+    config["storage"]["xor_mask"] = serde_json::to_value(mask).unwrap();
     fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
     let planned = tool(
         &["plan".into(), "--config".into(), path.as_os_str().into()],

@@ -184,6 +184,9 @@ pub(crate) struct PackOptions {
     /// Mask payload bodies with public XOR (0xA5), without a key.
     #[arg(long)]
     pub(crate) xor: bool,
+    /// Repeating public mask loaded from TOML.
+    #[arg(skip)]
+    pub(crate) xor_mask: Option<Vec<u8>>,
     /// Place the readable manifest after the launcher or after the stored pool.
     #[arg(long, value_enum, default_value = "end")]
     pub(crate) manifest_position: Position,
@@ -228,6 +231,12 @@ impl PackOptions {
     /// Validate shared CLI/config semantics without reading or writing input files.
     pub(crate) fn validate(&self) -> Result<(), Error> {
         self.budgets.validate()?;
+        if let Some(mask) = &self.xor_mask {
+            codec::validate_xor_mask(mask)?;
+            if self.xor {
+                return Err(Error::Invalid("choose either xor or xor_mask".into()));
+            }
+        }
         validate_env(&self.select_env)?;
         if self.inputs.is_empty()
             || self.inputs.len() > self.budgets.max_payloads
@@ -408,13 +417,18 @@ impl PackOptions {
     }
 
     /// Read inputs and finalize all object metadata before publishing output or encrypting bytes.
-    fn prepare(&self) -> Result<Prepared, Error> {
+    fn prepare(&self) -> Result<Prepared<'_>, Error> {
         self.validate()?;
         let launcher_path = self.launcher_path()?;
         let launcher = Elf::read(&launcher_path)?;
-        let mut pool = Pool::new(self.budgets.clone())?;
+        let mut pool = Pool::new(
+            self.budgets.clone(),
+            self.xor_mask.as_deref().unwrap_or_default(),
+        )?;
         let mut payloads = Vec::new();
-        let body_encoding = if self.xor {
+        let body_encoding = if self.xor_mask.is_some() {
+            Encoding::XorMask
+        } else if self.xor {
             Encoding::XorA5
         } else {
             Encoding::Identity
@@ -478,12 +492,14 @@ impl PackOptions {
             });
         }
         let (chunks, pool_length) = pool.layout(self.order, self.seed)?;
+        let mask_required = chunks.iter().any(|c| c.encoding == Encoding::XorMask);
         capabilities::validate_launcher(
             &launcher.bytes,
             LauncherCodecs {
                 compression: chunks.iter().any(|c| c.codec == StoredCodec::Lz4Block),
                 encryption: chunks.iter().any(|c| c.encryption.is_some()),
                 xor: chunks.iter().any(|c| c.encoding == Encoding::XorA5),
+                xor_mask: mask_required,
             },
         )?;
         let used: HashSet<&str> = chunks
@@ -512,6 +528,7 @@ impl PackOptions {
             manifest_position: self.manifest_position,
             budgets: self.budgets.clone(),
             keys: runtime_keys,
+            xor_mask: self.xor_mask.clone().filter(|_| mask_required),
             chunks,
             payloads,
         };
@@ -725,9 +742,9 @@ impl Write for BoundedManifest {
 }
 
 /// Fully bounded packing state whose manifest is finalized before output publication.
-struct Prepared {
+struct Prepared<'a> {
     launcher: Vec<u8>,
-    pool: Pool,
+    pool: Pool<'a>,
     pool_length: u64,
     output_length: u64,
     manifest: Manifest,
@@ -757,7 +774,8 @@ struct CandidateKey {
 }
 
 /// Encoded-only disk-backed object store, avoiding a simultaneous raw and encoded spool.
-struct Pool {
+struct Pool<'a> {
+    xor_mask: &'a [u8],
     file: File,
     objects: Vec<Object>,
     candidates: HashMap<CandidateKey, Vec<usize>>,
@@ -765,10 +783,11 @@ struct Pool {
     budgets: Budgets,
 }
 
-impl Pool {
+impl<'a> Pool<'a> {
     /// Create temporary backing storage with the build's enforced spool budgets.
-    fn new(budgets: Budgets) -> Result<Self, Error> {
+    fn new(budgets: Budgets, xor_mask: &'a [u8]) -> Result<Self, Error> {
         Ok(Self {
+            xor_mask,
             file: tempfile::tempfile().map_err(|error| {
                 Error::from(error).context("creating the build spool in TMPDIR".into())
             })?,
@@ -808,7 +827,14 @@ impl Pool {
                 self.file.seek(SeekFrom::Start(object.spool_offset))?;
                 let mut encoded = vec![0; object.stored_length as usize];
                 self.file.read_exact(&mut encoded)?;
-                if codec::decode(encoded, bytes.len(), object.codec, object.encoding)? == bytes {
+                if codec::decode(
+                    encoded,
+                    bytes.len(),
+                    object.codec,
+                    object.encoding,
+                    self.xor_mask,
+                )? == bytes
+                {
                     return Ok(id);
                 }
             }
@@ -816,7 +842,8 @@ impl Pool {
         if self.objects.len() >= self.budgets.max_objects {
             return Err(Error::Invalid("too many unique objects".into()));
         }
-        let (encoded, stored_codec) = codec::prepare(bytes, policy.compression, encoding)?;
+        let (encoded, stored_codec) =
+            codec::prepare(bytes, policy.compression, encoding, self.xor_mask)?;
         let spool_offset = self.file.seek(SeekFrom::End(0))?;
         spool_offset
             .checked_add(encoded.len() as u64)
@@ -1266,12 +1293,15 @@ mod tests {
 
     #[test]
     fn spool_enforces_object_and_disk_budgets_at_the_boundary() {
-        let mut pool = Pool::new(Budgets {
-            max_object_bytes: 4,
-            max_objects: 3,
-            max_spool_bytes: 5,
-            ..Budgets::default()
-        })
+        let mut pool = Pool::new(
+            Budgets {
+                max_object_bytes: 4,
+                max_objects: 3,
+                max_spool_bytes: 5,
+                ..Budgets::default()
+            },
+            &[],
+        )
         .unwrap();
         let policy = Policy {
             compression: Compression::None,
@@ -1302,7 +1332,7 @@ mod tests {
 
     #[test]
     fn seeded_layout_shuffles_runs_independently_between_anchors() {
-        let mut pool = Pool::new(Budgets::default()).unwrap();
+        let mut pool = Pool::new(Budgets::default(), &[]).unwrap();
         for (index, shuffle) in [true, false, true, true, true, true, false, true, true]
             .into_iter()
             .enumerate()

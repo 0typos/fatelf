@@ -55,8 +55,12 @@ pub(crate) fn run(config: &Path, json: bool, probe: bool) -> Result<(), Error> {
                         .as_ref()
                         .expect("invariant: launcher read includes codecs");
                     format!(
-                        "{:?}; v2; compression={}; encryption={}; xor={}",
-                        elf.architecture, codecs.compression, codecs.encryption, codecs.xor
+                        "{:?}; v2; compression={}; encryption={}; xor={}; xor_mask={}",
+                        elf.architecture,
+                        codecs.compression,
+                        codecs.encryption,
+                        codecs.xor,
+                        codecs.xor_mask
                     )
                 }),
             ));

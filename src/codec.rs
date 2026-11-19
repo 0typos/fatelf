@@ -42,6 +42,7 @@ pub(crate) enum Encoding {
     Identity,
     ElfHeaderXorA5,
     XorA5,
+    XorMask,
 }
 
 /// External-key identity and fresh nonce needed to authenticate a stored object.
@@ -121,16 +122,44 @@ mod nonce_hex {
     }
 }
 
+/// Maximum public mask stored once per configuration or bundle.
+pub(crate) const MAX_XOR_MASK: usize = 32;
+
+/// Reject an empty or oversized repeating mask.
+pub(crate) fn validate_xor_mask(mask: &[u8]) -> Result<(), Error> {
+    if !(1..=MAX_XOR_MASK).contains(&mask.len()) {
+        return Err(Error::Invalid(format!(
+            "xor_mask must contain 1 to {MAX_XOR_MASK} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Generate a public mask that can be saved in a reproducible build configuration.
+#[cfg(feature = "builder")]
+pub(crate) fn random_xor_mask(length: usize) -> Result<Vec<u8>, Error> {
+    if !(1..=MAX_XOR_MASK).contains(&length) {
+        return Err(Error::Invalid(format!(
+            "XOR mask length must be 1 to {MAX_XOR_MASK} bytes"
+        )));
+    }
+    let mut mask = vec![0; length];
+    getrandom::fill(&mut mask)
+        .map_err(|_| Error::Invalid("OS XOR mask generation failed".into()))?;
+    Ok(mask)
+}
+
 /// Encode source bytes and retain LZ4 only when it is strictly smaller.
 #[cfg(any(feature = "builder", test))]
 pub(crate) fn prepare(
     bytes: &[u8],
     compression: Compression,
     encoding: Encoding,
+    xor_mask: &[u8],
 ) -> Result<(Vec<u8>, StoredCodec), Error> {
     validate_length(bytes.len())?;
     let mut source = bytes.to_vec();
-    apply_encoding(&mut source, encoding);
+    apply_encoding(&mut source, encoding, xor_mask)?;
     if compression == Compression::None {
         return Ok((source, StoredCodec::Raw));
     }
@@ -165,6 +194,7 @@ pub(crate) fn decode(
     decoded_length: usize,
     codec: StoredCodec,
     encoding: Encoding,
+    xor_mask: &[u8],
 ) -> Result<Vec<u8>, Error> {
     validate_length(decoded_length)?;
     validate_length(bytes.len())?;
@@ -202,7 +232,7 @@ pub(crate) fn decode(
             }
         }
     }
-    apply_encoding(&mut bytes, encoding);
+    apply_encoding(&mut bytes, encoding, xor_mask)?;
     Ok(bytes)
 }
 
@@ -328,13 +358,23 @@ fn validate_length(length: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// Apply the fixed public byte mask; the operation is its own inverse.
-fn apply_encoding(bytes: &mut [u8], encoding: Encoding) {
-    if matches!(encoding, Encoding::ElfHeaderXorA5 | Encoding::XorA5) {
-        for byte in bytes {
-            *byte ^= 0xa5;
+/// Apply a public mask from the start of each object.
+fn apply_encoding(bytes: &mut [u8], encoding: Encoding, xor_mask: &[u8]) -> Result<(), Error> {
+    match encoding {
+        Encoding::Identity => {}
+        Encoding::ElfHeaderXorA5 | Encoding::XorA5 => {
+            for byte in bytes {
+                *byte ^= 0xa5;
+            }
+        }
+        Encoding::XorMask => {
+            validate_xor_mask(xor_mask)?;
+            for (byte, mask) in bytes.iter_mut().zip(xor_mask.iter().cycle()) {
+                *byte ^= mask;
+            }
         }
     }
+    Ok(())
 }
 
 /// Bind ciphertext to the exact versioned manifest and logical object identity.
@@ -416,23 +456,41 @@ mod tests {
     #[test]
     fn header_encoding_survives_raw_storage_and_reconstructs_exact_bytes() {
         let header = b"\x7fELF\x02\x01\x01\0";
-        let (stored, codec) = prepare(header, Compression::None, Encoding::ElfHeaderXorA5).unwrap();
+        let (stored, codec) =
+            prepare(header, Compression::None, Encoding::ElfHeaderXorA5, &[]).unwrap();
         assert_ne!(stored, header);
         assert_ne!(&stored[..4], b"\x7fELF");
         assert_eq!(
-            decode(stored, header.len(), codec, Encoding::ElfHeaderXorA5).unwrap(),
+            decode(stored, header.len(), codec, Encoding::ElfHeaderXorA5, &[]).unwrap(),
             header
         );
     }
 
     #[test]
+    fn repeating_xor_cycles_at_the_end_of_the_mask() {
+        let (stored, codec) = prepare(
+            &[0, 1, 2, 3, 4],
+            Compression::None,
+            Encoding::XorMask,
+            &[0x10, 0x20, 0x30],
+        )
+        .unwrap();
+        assert_eq!(stored, [0x10, 0x21, 0x32, 0x13, 0x24]);
+        assert_eq!(
+            decode(stored, 5, codec, Encoding::XorMask, &[0x10, 0x20, 0x30]).unwrap(),
+            [0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
     fn object_limits_reject_empty_oversized_and_wrong_raw_length() {
-        assert!(prepare(&[], Compression::None, Encoding::Identity).is_err());
+        assert!(prepare(&[], Compression::None, Encoding::Identity, &[]).is_err());
         assert!(
             prepare(
                 &vec![0; MAX_OBJECT + 1],
                 Compression::None,
-                Encoding::Identity
+                Encoding::Identity,
+                &[]
             )
             .is_err()
         );
@@ -441,17 +499,19 @@ mod tests {
                 vec![1],
                 MAX_OBJECT + 1,
                 StoredCodec::Raw,
-                Encoding::Identity
+                Encoding::Identity,
+                &[]
             )
             .is_err()
         );
-        assert!(decode(vec![1], 2, StoredCodec::Raw, Encoding::Identity).is_err());
+        assert!(decode(vec![1], 2, StoredCodec::Raw, Encoding::Identity, &[]).is_err());
         assert!(
             decode(
                 vec![0; MAX_OBJECT + 1],
                 1,
                 StoredCodec::Raw,
-                Encoding::Identity
+                Encoding::Identity,
+                &[]
             )
             .is_err()
         );
@@ -461,11 +521,12 @@ mod tests {
     #[test]
     fn incompressible_header_fallback_keeps_encoding() {
         let header = b"\x7fELF\x02\x01\x01\0";
-        let (stored, codec) = prepare(header, Compression::Lz4, Encoding::ElfHeaderXorA5).unwrap();
+        let (stored, codec) =
+            prepare(header, Compression::Lz4, Encoding::ElfHeaderXorA5, &[]).unwrap();
         assert_eq!(codec, StoredCodec::Raw);
         assert_ne!(stored, header);
         assert_eq!(
-            decode(stored, header.len(), codec, Encoding::ElfHeaderXorA5).unwrap(),
+            decode(stored, header.len(), codec, Encoding::ElfHeaderXorA5, &[]).unwrap(),
             header
         );
     }
@@ -475,11 +536,11 @@ mod tests {
     fn compressed_masked_objects_restore_original_source() {
         let original = vec![0x7f; 4096];
         let (stored, codec) =
-            prepare(&original, Compression::Lz4, Encoding::ElfHeaderXorA5).unwrap();
+            prepare(&original, Compression::Lz4, Encoding::ElfHeaderXorA5, &[]).unwrap();
         assert_eq!(codec, StoredCodec::Lz4Block);
         assert!(stored.len() < original.len());
         assert_eq!(
-            decode(stored, original.len(), codec, Encoding::ElfHeaderXorA5).unwrap(),
+            decode(stored, original.len(), codec, Encoding::ElfHeaderXorA5, &[]).unwrap(),
             original
         );
     }
@@ -492,7 +553,7 @@ mod tests {
         let mut expected = vec![b'A'; 20];
         expected.extend_from_slice(b"bcdef");
         assert_eq!(
-            decode(stored, 25, StoredCodec::Lz4Block, Encoding::Identity).unwrap(),
+            decode(stored, 25, StoredCodec::Lz4Block, Encoding::Identity, &[]).unwrap(),
             expected
         );
     }
@@ -506,25 +567,36 @@ mod tests {
                 vec![0x30, b'a', b'b', b'c'],
                 8,
                 StoredCodec::Lz4Block,
-                Encoding::Identity
+                Encoding::Identity,
+                &[]
             )
             .is_err()
         );
-        assert!(decode(vec![0xf0], 64, StoredCodec::Lz4Block, Encoding::Identity).is_err());
+        assert!(
+            decode(
+                vec![0xf0],
+                64,
+                StoredCodec::Lz4Block,
+                Encoding::Identity,
+                &[]
+            )
+            .is_err()
+        );
         let (stored, codec) =
-            prepare(&vec![1; 4096], Compression::Lz4, Encoding::Identity).unwrap();
-        assert!(decode(stored.clone(), 2048, codec, Encoding::Identity).is_err());
-        assert!(decode(stored, 8192, codec, Encoding::Identity).is_err());
+            prepare(&vec![1; 4096], Compression::Lz4, Encoding::Identity, &[]).unwrap();
+        assert!(decode(stored.clone(), 2048, codec, Encoding::Identity, &[]).is_err());
+        assert!(decode(stored, 8192, codec, Encoding::Identity, &[]).is_err());
     }
 
     #[cfg(feature = "compression")]
     #[test]
     fn a_one_mib_object_can_be_compressed_and_decoded() {
         let original = vec![7; 1_048_576];
-        let (stored, codec) = prepare(&original, Compression::Lz4, Encoding::Identity).unwrap();
+        let (stored, codec) =
+            prepare(&original, Compression::Lz4, Encoding::Identity, &[]).unwrap();
         assert_eq!(codec, StoredCodec::Lz4Block);
         assert_eq!(
-            decode(stored, original.len(), codec, Encoding::Identity).unwrap(),
+            decode(stored, original.len(), codec, Encoding::Identity, &[]).unwrap(),
             original
         );
     }
@@ -532,8 +604,8 @@ mod tests {
     #[cfg(not(feature = "compression"))]
     #[test]
     fn unavailable_compression_fails_explicitly() {
-        assert!(prepare(&[1; 64], Compression::Lz4, Encoding::Identity).is_err());
-        assert!(decode(vec![0], 64, StoredCodec::Lz4Block, Encoding::Identity).is_err());
+        assert!(prepare(&[1; 64], Compression::Lz4, Encoding::Identity, &[]).is_err());
+        assert!(decode(vec![0], 64, StoredCodec::Lz4Block, Encoding::Identity, &[]).is_err());
     }
 
     #[cfg(feature = "encryption")]

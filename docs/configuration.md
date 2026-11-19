@@ -85,7 +85,7 @@ in this release; inherited key descriptors/providers and secret delivery are lat
 |---|---|
 | Layout | `overlay`, with `front` or `end` manifest placement |
 | Chunking | Fixed size, 256 bytes–1 MiB; default 4096 |
-| Source encoding | Mandatory full-header `elf-header-xor-a5`; body `identity` or `xor-a5` |
+| Source encoding | Mandatory full-header `elf-header-xor-a5`; body `identity`, `xor-a5`, or `xor-mask` |
 | Compression | `none`, raw LZ4 blocks with automatic raw fallback |
 | Encryption | External-key XChaCha20-Poly1305, fresh OS nonce per unique object |
 | Placement | `ordered`, seeded `shuffled`; global, payload, section/range scope |
@@ -97,6 +97,13 @@ Use `fatelf pack --xor` or set `xor = true` under `[storage]` to XOR-mask
 every payload body with the fixed public byte `0xA5`. This requires an updated
 launcher. XOR itself needs no key and provides no confidentiality or authentication.
 The option defaults to false and can be combined with compression or encryption.
+
+For a repeating mask, run `fatelf xor-mask 16` and copy the printed
+`xor_mask = [...]` line into `[storage]` instead of setting `xor = true`.
+The generator accepts **1–32 bytes** and draws a new public mask from the OS
+on each invocation. Save the generated line once so `plan` and repeated
+builds use the same mask. This setting requires a launcher that supports
+variable payload XOR. The mask is stored in the bundle.
 
 Compression/encryption/shuffle inherit global → payload → region settings.
 `storage.encryption` supplies an optional default key ID; `encryption = "none"`

@@ -50,14 +50,16 @@ pub fn fuzz_container(bytes: &[u8]) {
         } else {
             codec::StoredCodec::Lz4Block
         };
-        let encoding = if prefix[0] & 4 != 0 {
+        let encoding = if prefix[0] & 8 != 0 {
+            codec::Encoding::XorMask
+        } else if prefix[0] & 4 != 0 {
             codec::Encoding::XorA5
         } else if prefix[0] & 2 == 0 {
             codec::Encoding::Identity
         } else {
             codec::Encoding::ElfHeaderXorA5
         };
-        let _ = codec::decode(bytes[3..].to_vec(), decoded_length, codec, encoding);
+        let _ = codec::decode(bytes[3..].to_vec(), decoded_length, codec, encoding, prefix);
         #[cfg(feature = "encryption")]
         let _ = codec::decrypt(&mut bytes[3..].to_vec(), &[0; 32], &[0; 24], &[0; 32], 0);
     }

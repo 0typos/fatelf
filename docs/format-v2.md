@@ -43,10 +43,13 @@ Each chunk has pool-relative `offset`, stored `length`, `decoded_length`, actual
 `codec` (`raw`/`lz4-block`), `encoding`, and optional encryption key ID/48-character
 nonce. Each payload has name, original length, `header_length`, BLAKE3 hex hash,
 and ordered chunk indices. Its first reference is exactly one masked 52/64-byte
-ELF header; remaining references use `identity` or the optional `xor-a5` body encoding. Noncanonical header
-extensions are rejected. `inspect` reports placement and object statistics.
+ELF header. Body references use `identity`, `xor-a5`, or `xor-mask`.
+Noncanonical header extensions are rejected. `inspect` reports placement and object statistics.
 
-Both XOR encodings apply the public byte mask `0xA5` before optional compression
+The header and `xor-a5` encodings apply the public byte mask `0xA5`.
+The `xor-mask` encoding repeats the public manifest `xor_mask` array (1–32
+bytes), starting at its first byte for every object. The array is required
+when any object uses `xor-mask` and otherwise omitted. Encoding precedes compression
 and AEAD. Raw fallback retains the source encoding. Decode authenticates first,
 decompresses into an exact bounded buffer, reverses the source encoding, validates
 the header, and verifies the original digest before execution/publication. AEAD associated
@@ -60,9 +63,10 @@ manifest fields, avoiding a circular commitment.
 
 Payload XOR is an opt-in v2 encoding extension. Builders require an ELF
 `.fatelf.xor` section containing exactly the eight ASCII bytes `FATXOR01` when
-writing `xor-a5` objects. This separate marker preserves the original
-`.fatelf` descriptor. Older readers reject XOR bundles. New readers also
-accept earlier v2 bundles.
+writing `xor-a5` objects. For `xor-mask` objects, builders require
+`.fatelf.xormask` containing `FATXOR02`. These markers preserve the original
+`.fatelf` descriptor. A reader without the corresponding extension rejects
+that encoding. New readers also accept earlier v2 bundles.
 
 **Version break:** TOML schema and container format are independently version 2.
 v1 configs/readers are unsupported; existing standalone v1 executables retain

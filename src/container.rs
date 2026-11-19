@@ -176,6 +176,8 @@ pub(crate) struct Manifest {
     pub(crate) manifest_position: Position,
     pub(crate) budgets: Budgets,
     pub(crate) keys: Vec<RuntimeKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) xor_mask: Option<Vec<u8>>,
     pub(crate) chunks: Vec<Chunk>,
     pub(crate) payloads: Vec<Payload>,
 }
@@ -219,8 +221,13 @@ impl Manifest {
                 "object count or stored pool exceeds budget".into(),
             ));
         }
+        if let Some(mask) = &self.xor_mask {
+            codec::validate_xor_mask(mask)?;
+        }
+        let mut uses_mask = false;
         let mut intervals = Vec::with_capacity(self.chunks.len());
         for chunk in &self.chunks {
+            uses_mask |= chunk.encoding == Encoding::XorMask;
             let tag = if let Some(encryption) = &chunk.encryption {
                 if !key_names.contains(&encryption.key) {
                     return Err(Error::Invalid("unknown encryption key".into()));
@@ -263,6 +270,11 @@ impl Manifest {
                 ));
             }
             intervals.push((chunk.offset, chunk.length));
+        }
+        if uses_mask != self.xor_mask.is_some() {
+            return Err(Error::Invalid(
+                "xor-mask objects and manifest xor_mask must appear together".into(),
+            ));
         }
         intervals.sort_unstable();
         let mut next = 0;
@@ -487,6 +499,7 @@ impl<R: Read + Seek> Container<R> {
                 chunk.decoded_length as usize,
                 chunk.codec,
                 chunk.encoding,
+                self.manifest.xor_mask.as_deref().unwrap_or_default(),
             )?;
             if ordinal == 0 && elf::header_length(&decoded)? as u64 != payload.header_length {
                 return Err(Error::Invalid(
@@ -599,6 +612,7 @@ pub(crate) mod tests {
             manifest_position: position,
             budgets: Budgets::default(),
             keys: vec![],
+            xor_mask: None,
             chunks: vec![
                 Chunk {
                     offset: 0,
@@ -952,6 +966,32 @@ pub(crate) mod tests {
                 "oversized pool",
                 |m| m.budgets.max_stored_bytes = 68,
                 "object count or stored pool exceeds budget",
+            ),
+            (
+                "missing XOR mask",
+                |m| m.chunks[1].encoding = Encoding::XorMask,
+                "xor-mask objects and manifest xor_mask must appear together",
+            ),
+            (
+                "unused XOR mask",
+                |m| m.xor_mask = Some(vec![1]),
+                "xor-mask objects and manifest xor_mask must appear together",
+            ),
+            (
+                "empty XOR mask",
+                |m| {
+                    m.chunks[1].encoding = Encoding::XorMask;
+                    m.xor_mask = Some(Vec::new());
+                },
+                "xor_mask must contain 1 to 32 bytes",
+            ),
+            (
+                "oversized XOR mask",
+                |m| {
+                    m.chunks[1].encoding = Encoding::XorMask;
+                    m.xor_mask = Some(vec![1; 33]);
+                },
+                "xor_mask must contain 1 to 32 bytes",
             ),
             (
                 "empty decoded chunk",

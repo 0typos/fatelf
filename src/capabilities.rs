@@ -13,6 +13,11 @@ const ENCRYPTION: u8 = 2;
 #[unsafe(link_section = ".fatelf.xor")]
 static XOR_DESCRIPTOR: [u8; 8] = *b"FATXOR01";
 
+/// Separate extension marker keeps fixed-XOR launchers distinguishable.
+#[used]
+#[unsafe(link_section = ".fatelf.xormask")]
+static XOR_MASK_DESCRIPTOR: [u8; 8] = *b"FATXOR02";
+
 /// Allocated descriptor survives stripping; the entrypoint references it as well.
 #[used]
 #[unsafe(link_section = ".fatelf")]
@@ -38,13 +43,18 @@ static DESCRIPTOR: [u8; 16] = [
 
 /// Keep the capability descriptor reachable when the runtime is linked and stripped.
 pub(crate) fn retain() {
-    std::hint::black_box((&DESCRIPTOR, &XOR_DESCRIPTOR));
+    std::hint::black_box((&DESCRIPTOR, &XOR_DESCRIPTOR, &XOR_MASK_DESCRIPTOR));
 }
 
 /// Reject old or insufficient supplied launchers before constructing a new container.
 #[cfg(feature = "builder")]
 pub(crate) fn validate_launcher(bytes: &[u8], required: LauncherCodecs) -> Result<(), Error> {
     let supported = launcher_codecs(&object::File::parse(bytes)?)?;
+    if required.xor_mask && !supported.xor_mask {
+        return Err(Error::Invalid(
+            "launcher does not support variable payload XOR".into(),
+        ));
+    }
     if required.xor && !supported.xor {
         return Err(Error::Invalid(
             "launcher does not support payload XOR".into(),
@@ -66,6 +76,7 @@ pub(crate) struct LauncherCodecs {
     pub(crate) compression: bool,
     pub(crate) encryption: bool,
     pub(crate) xor: bool,
+    pub(crate) xor_mask: bool,
 }
 
 /// Read the launcher descriptor without executing it.
@@ -99,5 +110,8 @@ pub(crate) fn launcher_codecs<'data>(elf: &impl Object<'data>) -> Result<Launche
         xor: elf
             .section_by_name(".fatelf.xor")
             .is_some_and(|section| section.data() == Ok(XOR_DESCRIPTOR.as_slice())),
+        xor_mask: elf
+            .section_by_name(".fatelf.xormask")
+            .is_some_and(|section| section.data() == Ok(XOR_MASK_DESCRIPTOR.as_slice())),
     })
 }

@@ -90,6 +90,8 @@ pub(crate) struct Storage {
     #[serde(skip_serializing_if = "is_false")]
     pub(crate) xor: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) xor_mask: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) encryption: Option<String>,
 }
 
@@ -111,6 +113,7 @@ impl Default for Storage {
             manifest_position: Position::End,
             compression: Compression::None,
             xor: false,
+            xor_mask: None,
             encryption: None,
         }
     }
@@ -218,6 +221,7 @@ impl BuildConfig {
             shuffle_payloads: Vec::new(),
             compression: self.storage.compression,
             xor: self.storage.xor,
+            xor_mask: self.storage.xor_mask.clone(),
             manifest_position: self.storage.manifest_position,
             encryption: self.storage.encryption.clone(),
             keys: self

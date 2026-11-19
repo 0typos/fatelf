@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 
 use crate::{
-    codec::StoredCodec,
+    codec::{StoredCodec, random_xor_mask},
     config::Document,
     container::Container,
     doctor,
@@ -64,6 +64,8 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Generate a random public XOR mask for a TOML storage table.
+    XorMask { length: usize },
     /// Print selection policy, payloads, and storage statistics as JSON.
     Inspect { input: PathBuf },
     /// Verify every payload without running it or writing extracted files.
@@ -82,6 +84,11 @@ enum Command {
 pub(crate) fn run() -> Result<(), Error> {
     match Cli::parse().command {
         Command::Pack(options) => options.pack(),
+        Command::XorMask { length } => {
+            let mask = random_xor_mask(length)?;
+            writeln!(io::stdout().lock(), "xor_mask = {mask:?}")?;
+            Ok(())
+        }
         Command::Build { config } => Document::load(&config)?.build(),
         Command::Plan { config } => {
             let document = Document::load(&config)?;
